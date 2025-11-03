@@ -192,8 +192,10 @@ class AutoMemClient:
         """Check API health
 
         Returns:
-            Health status dict
+            Health status dict with optional project stats
         """
+        # Health endpoint will include project stats if X-Project-ID header is set
+        # (it's already set in client headers from __init__)
         response = self.client.get("/health")
         response.raise_for_status()
         return response.json()

@@ -295,6 +295,14 @@ def health(ctx, json_mode):
                 qdrant_status = "✓" if result["qdrant"] else "✗"
                 output_info(f"Qdrant: {qdrant_status}")
 
+            # Show project stats if available
+            if "project" in result:
+                project = result["project"]
+                output_info(f"Project: {project.get('id', 'unknown')}")
+                output_info(f"  Memories: {project.get('memories', 0)}")
+                if project.get("patterns", 0) > 0:
+                    output_info(f"  Patterns: {project.get('patterns', 0)}")
+
     except httpx.HTTPStatusError as e:
         if json_mode:
             output_json({"error": str(e), "status_code": e.response.status_code, "success": False})

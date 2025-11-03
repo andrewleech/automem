@@ -2772,13 +2772,13 @@ def health() -> Any:
     qdrant_available = get_qdrant_client() is not None
 
     status = "healthy" if graph_available and qdrant_available else "degraded"
-    
+
     # Get enrichment queue stats (non-authenticated for monitoring)
     enrichment_thread_alive = bool(state.enrichment_thread and state.enrichment_thread.is_alive())
     with state.enrichment_lock:
         enrichment_pending = len(state.enrichment_pending)
         enrichment_inflight = len(state.enrichment_inflight)
-    
+
     health_data = {
         "status": status,
         "falkordb": "connected" if graph_available else "disconnected",
@@ -2794,6 +2794,34 @@ def health() -> Any:
         "timestamp": utc_now(),
         "graph": GRAPH_NAME,
     }
+
+    # Optionally include project-specific stats if X-Project-ID header provided
+    project_id = request.headers.get("X-Project-ID")
+    if project_id and graph_available:
+        try:
+            graph = get_memory_graph()
+            result = graph.query(
+                "MATCH (m:Memory) WHERE m.project_id = $project_id RETURN COUNT(m) as count",
+                {"project_id": project_id}
+            )
+            memory_count = result.result_set[0][0] if result.result_set else 0
+
+            pattern_result = graph.query(
+                "MATCH (p:Pattern) WHERE p.project_id = $project_id RETURN COUNT(p) as count",
+                {"project_id": project_id}
+            )
+            pattern_count = pattern_result.result_set[0][0] if pattern_result.result_set else 0
+
+            health_data["project"] = {
+                "id": project_id,
+                "memories": memory_count,
+                "patterns": pattern_count,
+            }
+        except Exception:
+            logger.exception("Failed to fetch project stats for health check")
+            # Don't fail health check if project stats fail
+            pass
+
     return jsonify(health_data)
 
 
