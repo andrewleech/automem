@@ -26,6 +26,7 @@ from threading import Thread, Event, Lock
 from queue import Empty, Queue
 import time
 
+import redis.exceptions
 from dotenv import load_dotenv
 from flask import Flask, abort, jsonify, request
 from falkordb import FalkorDB
@@ -2939,9 +2940,13 @@ def store_memory() -> Any:
 
     try:
         graph.query(query, params)
-    except Exception:  # pragma: no cover - log full stack trace in production
+    except redis.exceptions.ResponseError as e:
+        # FalkorDB/Redis error - return specific error message
+        logger.error("FalkorDB query error: %s", str(e))
+        abort(400, description=f"FalkorDB error: {str(e)}")
+    except Exception as e:  # pragma: no cover - log full stack trace in production
         logger.exception("Failed to persist memory in FalkorDB")
-        abort(500, description="Failed to store memory in FalkorDB")
+        abort(500, description=f"Failed to store memory: {type(e).__name__}")
 
     # Queue for enrichment
     enqueue_enrichment(memory_id)
@@ -3468,9 +3473,13 @@ def create_association() -> Any:
                 **relationship_props,
             },
         )
-    except Exception:  # pragma: no cover - log full stack trace in production
+    except redis.exceptions.ResponseError as e:
+        # FalkorDB/Redis error - return specific error message
+        logger.error("FalkorDB relationship error: %s", str(e))
+        abort(400, description=f"FalkorDB error: {str(e)}")
+    except Exception as e:  # pragma: no cover - log full stack trace in production
         logger.exception("Failed to create association")
-        abort(500, description="Failed to create association")
+        abort(500, description=f"Failed to create association: {type(e).__name__}")
 
     if not result.result_set:
         abort(404, description=f"One or both memories do not exist or do not belong to project '{project_id}'")
