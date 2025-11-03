@@ -18,6 +18,7 @@ class AutoMemClient {
     const url = `${this.config.endpoint.replace(/\/$/, '')}/${path.replace(/^\//, '')}`;
     const headers = { 'Content-Type': 'application/json' };
     if (this.config.apiKey) headers['Authorization'] = `Bearer ${this.config.apiKey}`;
+    if (this.config.projectId) headers['X-Project-ID'] = this.config.projectId;
     const res = await fetch(url, {
       method,
       headers,
@@ -258,15 +259,27 @@ function getAuthToken(req) {
   );
 }
 
+// Helper: extract project ID from multiple sources
+// Returns undefined if no project ID specified (API will use NULL/unnamed project)
+function getProjectId(req) {
+  return (
+    req.headers['x-project-id'] ||
+    req.query.project_id ||
+    process.env.AUTOMEM_PROJECT_ID
+  );
+}
+
 // SSE endpoint
 app.get('/mcp/sse', async (req, res) => {
   try {
     const endpoint = process.env.AUTOMEM_ENDPOINT || 'http://127.0.0.1:8001';
     const token = getAuthToken(req);
+    const projectId = getProjectId(req);
     if (!endpoint) return res.status(500).json({ error: 'AUTOMEM_ENDPOINT not configured' });
     if (!token) return res.status(401).json({ error: 'Missing API token (use Authorization: Bearer, X-API-Key, or ?api_key=)' });
 
-    const client = new AutoMemClient({ endpoint, apiKey: token });
+    console.log(`[MCP] Creating client for project: ${projectId}`);
+    const client = new AutoMemClient({ endpoint, apiKey: token, projectId });
     const server = buildMcpServer(client);
     // Help with proxy buffering before SSE headers are written
     res.set('X-Accel-Buffering', 'no');

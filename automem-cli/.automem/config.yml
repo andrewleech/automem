@@ -1,0 +1,5 @@
+endpoint: http://localhost:8001
+api_token: ${AUTOMEM_API_TOKEN}
+project_id: test-project
+auto_consolidate: true
+session_tracking: true

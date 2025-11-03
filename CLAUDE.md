@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 AutoMem is a Flask-based memory service that provides durable memory storage for AI assistants using FalkorDB (graph database) for relationships and Qdrant (vector database) for semantic search. The service gracefully degrades when Qdrant is unavailable, ensuring graph operations always succeed.
 
+**NEW**: AutoMem now supports project isolation - a single Docker deployment can serve multiple projects with completely separate memory spaces. See [docs/PROJECT_ISOLATION.md](docs/PROJECT_ISOLATION.md) for details.
+
 ## Development Commands
 
 ```bash

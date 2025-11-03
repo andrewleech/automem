@@ -88,7 +88,10 @@ class MockGraph:
             results = []
             for mem_id, mem in self.memories.items():
                 if mem.get("content"):
-                    results.append([mem_id, mem["content"]])
+                    # Include project_id as third column (defaults to __default__)
+                    from app import DEFAULT_PROJECT
+                    project_id = mem.get("project_id", DEFAULT_PROJECT)
+                    results.append([mem_id, mem["content"], project_id])
             return SimpleNamespace(result_set=results)
 
         # Handle association creation - check both memories exist
@@ -151,6 +154,17 @@ class MockQdrantClient:
             for point_id in points_selector.points:
                 if point_id in self.points:
                     del self.points[point_id]
+
+    def get_collections(self):
+        """Mock get_collections operation."""
+        # Return mock collections response
+        mock_collection = Mock()
+        mock_collection.name = "memories"
+        return Mock(collections=[mock_collection])
+
+    def create_collection(self, collection_name, vectors_config):
+        """Mock create_collection operation."""
+        pass  # No-op for tests
 
 
 @pytest.fixture

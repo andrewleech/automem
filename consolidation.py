@@ -12,6 +12,7 @@ Implements biological memory consolidation patterns:
 import json
 import logging
 import math
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -118,6 +119,9 @@ class MemoryConsolidator:
     - Forgetting is controlled and serves learning
     """
 
+    # Class-level lock to prevent concurrent consolidation runs
+    _consolidation_lock = threading.Lock()
+
     def __init__(self, graph: GraphLike, vector_store: Optional[VectorStoreProtocol] = None):
         self.graph = graph
         self.vector_store = vector_store
@@ -136,6 +140,26 @@ class MemoryConsolidator:
         self.archive_threshold = 0.2  # Archive below this relevance
         self.delete_threshold = 0.05  # Delete below this (very old, unused)
 
+    def _get_all_project_ids(self) -> List[str]:
+        """Get all distinct project IDs from memory nodes.
+
+        Returns list including DEFAULT_PROJECT for unnamed project if it has memories.
+        Returns empty list if no memories exist (fresh database).
+        """
+        try:
+            query = """
+                MATCH (m:Memory)
+                RETURN DISTINCT m.project_id as project_id
+                ORDER BY m.project_id
+            """
+            rows = self._query_graph(query)
+            # Include None for unnamed project (NULL in database)
+            project_ids = [row[0] if row[0] else None for row in rows]
+            return project_ids  # Return empty list if no projects found
+        except Exception:
+            logger.exception("Failed to get project IDs")
+            return []  # Return empty list on error
+
     def _query_graph(self, query: str, params: Optional[Dict[str, Any]] = None) -> List[Sequence[Any]]:
         """Execute graph query and return the raw result set from FalkorDB."""
 
@@ -149,16 +173,18 @@ class MemoryConsolidator:
         rows = getattr(result, "result_set", result)
         return list(rows or [])
 
-    @lru_cache(maxsize=10000)
+    @lru_cache(maxsize=1000)
     def _get_relationship_count_cached_impl(self, memory_id: str, hour_key: int) -> int:
         """
         Implementation of relationship count query with caching.
-        
+
         The hour_key parameter causes cache invalidation every hour,
         balancing freshness with performance (~80% query reduction).
+        Cache size limited to 1000 entries to prevent memory exhaustion.
         """
         relationship_query = """
             MATCH (m:Memory {id: $id})-[r]-(other:Memory)
+            WHERE m.project_id = other.project_id
             RETURN COUNT(DISTINCT r) as rel_count
         """
         rel_result = self._query_graph(relationship_query, {"id": memory_id})
@@ -168,7 +194,8 @@ class MemoryConsolidator:
     
     def _get_relationship_count(self, memory_id: str) -> int:
         """Get relationship count for a memory with hourly cache invalidation."""
-        hour_key = int(time.time() / 3600)  # Changes every hour
+        # Use modulo to keep hour_key bounded (168 hours = 1 week cycle)
+        hour_key = int(time.time() / 3600) % 168
         try:
             return self._get_relationship_count_cached_impl(memory_id, hour_key)
         except Exception:
@@ -231,6 +258,7 @@ class MemoryConsolidator:
 
     def discover_creative_associations(
         self,
+        project_id: str,
         sample_size: int = 20
     ) -> List[Dict[str, Any]]:
         """
@@ -243,14 +271,15 @@ class MemoryConsolidator:
 
         sample_query = """
             MATCH (m:Memory)
-            WHERE m.relevance_score > 0.3
+            WHERE m.project_id = $project_id
+              AND m.relevance_score > 0.3
             RETURN m.id as id, m.content as content, m.type as type,
                    m.embeddings as embeddings, m.timestamp as timestamp
             ORDER BY rand()
             LIMIT $limit
         """
 
-        sample_rows = self._query_graph(sample_query, {"limit": sample_size})
+        sample_rows = self._query_graph(sample_query, {"project_id": project_id, "limit": sample_size})
         if len(sample_rows) < 2:
             return associations
 
@@ -329,7 +358,7 @@ class MemoryConsolidator:
 
         return associations
 
-    def cluster_similar_memories(self) -> List[Dict[str, Any]]:
+    def cluster_similar_memories(self, project_id: str) -> List[Dict[str, Any]]:
         """
         Cluster highly similar memories for potential compression.
 
@@ -341,13 +370,14 @@ class MemoryConsolidator:
         # Get memories with embeddings
         embedding_query = """
             MATCH (m:Memory)
-            WHERE m.embeddings IS NOT NULL
-                AND m.relevance_score > 0.3
+            WHERE m.project_id = $project_id
+              AND m.embeddings IS NOT NULL
+              AND m.relevance_score > 0.3
             RETURN m.id as id, m.content as content,
                    m.embeddings as embeddings, m.type as type
         """
 
-        result = self._query_graph(embedding_query, {})
+        result = self._query_graph(embedding_query, {"project_id": project_id})
         if len(result) < self.min_cluster_size:
             return clusters
 
@@ -432,6 +462,7 @@ class MemoryConsolidator:
 
     def apply_controlled_forgetting(
         self,
+        project_id: str,
         dry_run: bool = True
     ) -> Dict[str, Any]:
         """
@@ -449,13 +480,14 @@ class MemoryConsolidator:
         # Get all memories with scores
         all_memories_query = """
             MATCH (m:Memory)
+            WHERE m.project_id = $project_id
             RETURN m.id as id, m.content as content,
                    m.relevance_score as score, m.timestamp as timestamp,
                    m.type as type, m.importance as importance,
                    m.last_accessed as last_accessed
         """
 
-        result = self._query_graph(all_memories_query, {})
+        result = self._query_graph(all_memories_query, {"project_id": project_id})
         current_time = datetime.now(timezone.utc)
 
         for row in result:
@@ -544,8 +576,9 @@ class MemoryConsolidator:
 
         return stats
 
-    def consolidate(
+    def consolidate_project(
         self,
+        project_id: str,
         mode: str = 'full',
         dry_run: bool = True,
         decay_threshold: Optional[float] = None
@@ -572,13 +605,13 @@ class MemoryConsolidator:
             if mode in ['full', 'decay']:
                 logger.info("Applying exponential decay to memories...")
                 threshold = decay_threshold if mode == 'decay' else None
-                decay_stats = self._apply_decay(importance_threshold=threshold)
+                decay_stats = self._apply_decay(project_id, importance_threshold=threshold)
                 results['steps']['decay'] = decay_stats
 
             # Step 2: Discover creative associations
             if mode in ['full', 'creative']:
                 logger.info("Discovering creative associations...")
-                associations = self.discover_creative_associations(sample_size=30)
+                associations = self.discover_creative_associations(project_id, sample_size=30)
 
                 # Create the discovered relationships
                 created = 0
@@ -616,7 +649,7 @@ class MemoryConsolidator:
             # Step 3: Cluster similar memories
             if mode in ['full', 'cluster']:
                 logger.info("Clustering similar memories...")
-                clusters = self.cluster_similar_memories()
+                clusters = self.cluster_similar_memories(project_id)
 
                 # Create cluster meta-memories if significant
                 meta_created = 0
@@ -633,7 +666,8 @@ class MemoryConsolidator:
                                 confidence: 0.8,
                                 cluster_size: $size,
                                 timestamp: $timestamp,
-                                relevance_score: 0.9
+                                relevance_score: 0.9,
+                                project_id: $project_id
                             })
                         """
 
@@ -641,20 +675,22 @@ class MemoryConsolidator:
                             "id": cluster['cluster_id'],
                             "content": meta_content,
                             "size": cluster['size'],
-                            "timestamp": cluster['created_at']
+                            "timestamp": cluster['created_at'],
+                            "project_id": project_id
                         })
 
                         # Link meta-memory to cluster members
                         for mem_id in cluster['memory_ids']:
                             link_query = """
-                                MATCH (meta:MetaMemory {id: $meta_id})
-                                MATCH (m:Memory {id: $mem_id})
+                                MATCH (meta:MetaMemory {id: $meta_id, project_id: $project_id})
+                                MATCH (m:Memory {id: $mem_id, project_id: $project_id})
                                 CREATE (meta)-[:SUMMARIZES]->(m)
                             """
                             try:
                                 self.graph.query(link_query, {
                                     "meta_id": cluster['cluster_id'],
-                                    "mem_id": mem_id
+                                    "mem_id": mem_id,
+                                    "project_id": project_id
                                 })
                             except:
                                 pass
@@ -670,7 +706,7 @@ class MemoryConsolidator:
             # Step 4: Controlled forgetting
             if mode in ['full', 'forget']:
                 logger.info("Applying controlled forgetting...")
-                forget_stats = self.apply_controlled_forgetting(dry_run=dry_run)
+                forget_stats = self.apply_controlled_forgetting(project_id, dry_run=dry_run)
                 results['steps']['forget'] = forget_stats
 
             results['completed_at'] = datetime.now(timezone.utc).isoformat()
@@ -683,7 +719,84 @@ class MemoryConsolidator:
 
         return results
 
-    def _apply_decay(self, importance_threshold: Optional[float] = None) -> Dict[str, Any]:
+    def consolidate(
+        self,
+        mode: str = 'full',
+        dry_run: bool = True,
+        decay_threshold: Optional[float] = None
+    ) -> Dict[str, Any]:
+        """
+        Run consolidation across all projects.
+
+        This is the main entry point that ensures project isolation
+        by processing each project separately.
+        """
+        # Acquire lock to prevent concurrent consolidation runs
+        if not self._consolidation_lock.acquire(blocking=False):
+            logger.warning("Consolidation already in progress, skipping this run")
+            return {
+                'mode': mode,
+                'dry_run': dry_run,
+                'started_at': datetime.now(timezone.utc).isoformat(),
+                'skipped': True,
+                'reason': 'Consolidation already in progress',
+                'success': False
+            }
+
+        try:
+            overall_results = {
+                'mode': mode,
+                'dry_run': dry_run,
+                'started_at': datetime.now(timezone.utc).isoformat(),
+                'projects': {}
+            }
+            # Get all project IDs
+            project_ids = self._get_all_project_ids()
+            logger.info(f"Running {mode} consolidation for {len(project_ids)} projects: {project_ids}")
+
+            # Process each project separately
+            for project_id in project_ids:
+                try:
+                    logger.info(f"Processing project: {project_id}")
+                    project_results = self.consolidate_project(
+                        project_id=project_id,
+                        mode=mode,
+                        dry_run=dry_run,
+                        decay_threshold=decay_threshold
+                    )
+                    overall_results['projects'][project_id] = project_results
+                except Exception as e:
+                    logger.error(f"Failed to consolidate project {project_id}: {e}")
+                    overall_results['projects'][project_id] = {
+                        'success': False,
+                        'error': str(e)
+                    }
+
+            overall_results['completed_at'] = datetime.now(timezone.utc).isoformat()
+            overall_results['success'] = True
+
+            # Aggregate stats
+            total_processed = sum(
+                proj.get('steps', {}).get('decay', {}).get('processed', 0)
+                for proj in overall_results['projects'].values()
+                if isinstance(proj, dict)
+            )
+            overall_results['total_processed'] = total_processed
+
+            return overall_results
+
+        except Exception as e:
+            logger.error(f"Overall consolidation error: {e}")
+            overall_results['error'] = str(e)
+            overall_results['success'] = False
+            overall_results['completed_at'] = datetime.now(timezone.utc).isoformat()
+
+            return overall_results
+        finally:
+            # Always release the lock
+            self._consolidation_lock.release()
+
+    def _apply_decay(self, project_id: str, importance_threshold: Optional[float] = None) -> Dict[str, Any]:
         """Apply decay to all memories and return statistics."""
         stats = {
             'processed': 0,
@@ -697,8 +810,8 @@ class MemoryConsolidator:
             }
         }
 
-        filters = ["(m.archived IS NULL OR m.archived = false)"]
-        params: Dict[str, Any] = {}
+        filters = ["m.project_id = $project_id", "(m.archived IS NULL OR m.archived = false)"]
+        params: Dict[str, Any] = {"project_id": project_id}
 
         if importance_threshold is not None:
             filters.append("m.importance IS NOT NULL AND m.importance >= $importance_threshold")

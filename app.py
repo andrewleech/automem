@@ -48,6 +48,12 @@ except ImportError:
 
 # Import only the interface; import backends lazily in init_embedding_provider()
 from automem.embedding.provider import EmbeddingProvider
+from automem.utils.tags import (
+    _normalize_tag_list,
+    _expand_tag_prefixes,
+    _compute_tag_prefixes,
+    _prepare_tag_filters,
+)
 
 try:
     import spacy  # type: ignore
@@ -90,6 +96,11 @@ COLLECTION_NAME = os.getenv("QDRANT_COLLECTION", "memories")
 VECTOR_SIZE = int(os.getenv("VECTOR_SIZE") or os.getenv("QDRANT_VECTOR_SIZE", "768"))
 GRAPH_NAME = os.getenv("FALKORDB_GRAPH", "memories")
 FALKORDB_PORT = int(os.getenv("FALKORDB_PORT", "6379"))
+
+# Project isolation: Magic string for unnamed/default project
+# Using "__default__" instead of NULL for simpler queries and MERGE operations
+# User projects cannot start with "__" (enforced in validation)
+DEFAULT_PROJECT = "__default__"
 
 # Consolidation scheduling defaults (seconds unless noted)
 CONSOLIDATION_TICK_SECONDS = int(os.getenv("CONSOLIDATION_TICK_SECONDS", "60"))
@@ -223,40 +234,6 @@ SEARCH_WEIGHT_EXACT = float(os.getenv("SEARCH_WEIGHT_EXACT", "0.15"))
 API_TOKEN = os.getenv("AUTOMEM_API_TOKEN")
 ADMIN_TOKEN = os.getenv("ADMIN_API_TOKEN")
 
-
-def _normalize_tag_list(raw: Any) -> List[str]:
-    if raw is None:
-        return []
-    if isinstance(raw, str):
-        if not raw.strip():
-            return []
-        return [part.strip() for part in raw.split(",") if part.strip()]
-    if isinstance(raw, (list, tuple, set)):
-        tags: List[str] = []
-        for item in raw:
-            if isinstance(item, str) and item.strip():
-                tags.append(item.strip())
-        return tags
-    return []
-
-
-def _expand_tag_prefixes(tag: str) -> List[str]:
-    """Expand a tag into all prefixes using ':' as the canonical delimiter."""
-    parts = re.split(r"[:/]", tag)
-    prefixes: List[str] = []
-    accumulator: List[str] = []
-    for part in parts:
-        if not part:
-            continue
-        accumulator.append(part)
-        prefixes.append(":".join(accumulator))
-    return prefixes
-
-
-def _compute_tag_prefixes(tags: List[str]) -> List[str]:
-    """Compute unique, lowercased tag prefixes for fast prefix filtering."""
-    seen: Set[str] = set()
-
 try:
     from automem.utils.text import (
         SEARCH_STOPWORDS as _AM_SEARCH_STOPWORDS,
@@ -288,58 +265,6 @@ except Exception:
             seen.add(cleaned)
             keywords.append(cleaned)
         return keywords
-
-
-# Local tag helpers (keep in-app for compatibility)
-def _normalize_tag_list(raw: Any) -> List[str]:
-    if raw is None:
-        return []
-    if isinstance(raw, str):
-        if not raw.strip():
-            return []
-        return [part.strip() for part in raw.split(",") if part.strip()]
-    if isinstance(raw, (list, tuple, set)):
-        tags: List[str] = []
-        for item in raw:
-            if isinstance(item, str) and item.strip():
-                tags.append(item.strip())
-        return tags
-    return []
-
-
-def _expand_tag_prefixes(tag: str) -> List[str]:
-    parts = re.split(r"[:/]", tag)
-    prefixes: List[str] = []
-    accumulator: List[str] = []
-    for part in parts:
-        if not part:
-            continue
-        accumulator.append(part)
-        prefixes.append(":".join(accumulator))
-    return prefixes
-
-
-def _compute_tag_prefixes(tags: List[str]) -> List[str]:
-    """Compute unique, lowercased tag prefixes for fast prefix filtering."""
-    seen: Set[str] = set()
-    prefixes: List[str] = []
-    for tag in tags or []:
-        normalized = (tag or "").strip().lower()
-        if not normalized:
-            continue
-        for prefix in _expand_tag_prefixes(normalized):
-            if prefix not in seen:
-                seen.add(prefix)
-                prefixes.append(prefix)
-    return prefixes
-
-
-def _prepare_tag_filters(tag_filters: Optional[List[str]]) -> List[str]:
-    return [
-        tag.strip().lower()
-        for tag in (tag_filters or [])
-        if isinstance(tag, str) and tag.strip()
-    ]
 
 
 # Local time helpers (fallback if package not available)
@@ -659,6 +584,8 @@ def _format_graph_result(
     score: Optional[float],
     match_type: str,
     seen_ids: set[str],
+    project_id: str,
+    relations_map: Optional[Dict[str, List[Dict[str, Any]]]] = None,
 ) -> Optional[Dict[str, Any]]:
     data = _serialize_node(node)
     memory_id = str(data.get("id")) if data.get("id") is not None else None
@@ -666,7 +593,11 @@ def _format_graph_result(
         return None
 
     seen_ids.add(memory_id)
-    relations: List[Dict[str, Any]] = _fetch_relations(graph, memory_id)
+    # Use pre-fetched relations if available, otherwise fetch individually
+    if relations_map is not None:
+        relations = relations_map.get(memory_id, [])
+    else:
+        relations = _fetch_relations(graph, memory_id, project_id)
 
     numeric_score = float(score) if score is not None else 0.0
     return {
@@ -682,6 +613,7 @@ def _format_graph_result(
 
 def _graph_trending_results(
     graph: Any,
+    project_id: str,
     limit: int,
     seen_ids: set[str],
     start_time: Optional[str] = None,
@@ -692,8 +624,8 @@ def _graph_trending_results(
 ) -> List[Dict[str, Any]]:
     """Return high-importance memories when no specific query is supplied."""
     try:
-        where_clauses = ["coalesce(m.archived, false) = false"]
-        params: Dict[str, Any] = {"limit": limit}
+        where_clauses = ["coalesce(m.archived, false) = false", "m.project_id = $project_id"]
+        params: Dict[str, Any] = {"limit": limit, "project_id": project_id}
         if start_time:
             where_clauses.append("m.timestamp >= $start_time")
             params["start_time"] = start_time
@@ -718,9 +650,24 @@ def _graph_trending_results(
         logger.exception("Failed to load trending memories")
         return []
 
-    trending: List[Dict[str, Any]] = []
+    # Extract memory nodes and IDs for bulk relation fetch
+    nodes = []
+    memory_ids = []
     for row in getattr(result, "result_set", []) or []:
-        record = _format_graph_result(graph, row[0], None, "trending", seen_ids)
+        node = row[0]
+        data = _serialize_node(node)
+        memory_id = str(data.get("id")) if data.get("id") is not None else None
+        if memory_id and memory_id not in seen_ids:
+            nodes.append(node)
+            memory_ids.append(memory_id)
+
+    # Bulk fetch relations to avoid N+1 queries
+    relations_map = _fetch_relations_bulk(graph, memory_ids, project_id)
+
+    # Format results with pre-fetched relations
+    trending: List[Dict[str, Any]] = []
+    for node in nodes:
+        record = _format_graph_result(graph, node, None, "trending", seen_ids, project_id, relations_map)
         if record is None:
             continue
         # Use importance as a pseudo-score for ordering consistency
@@ -734,6 +681,7 @@ def _graph_trending_results(
 
 def _graph_keyword_search(
     graph: Any,
+    project_id: str,
     query_text: str,
     limit: int,
     seen_ids: set[str],
@@ -748,6 +696,7 @@ def _graph_keyword_search(
     if not normalized or normalized == "*":
         return _graph_trending_results(
             graph,
+            project_id,
             limit,
             seen_ids,
             start_time,
@@ -761,8 +710,8 @@ def _graph_keyword_search(
     phrase = normalized if len(normalized) >= 3 else ""
 
     try:
-        base_where = ["m.content IS NOT NULL"]
-        params: Dict[str, Any] = {"limit": limit}
+        base_where = ["m.content IS NOT NULL", "m.project_id = $project_id"]
+        params: Dict[str, Any] = {"limit": limit, "project_id": project_id}
         if start_time:
             base_where.append("m.timestamp >= $start_time")
             params["start_time"] = start_time
@@ -831,11 +780,25 @@ def _graph_keyword_search(
         logger.exception("Graph keyword search failed")
         return []
 
-    matches: List[Dict[str, Any]] = []
+    # Extract nodes, scores, and IDs for bulk relation fetch
+    nodes_and_scores = []
+    memory_ids = []
     for row in getattr(result, "result_set", []) or []:
         node = row[0]
         score = row[1] if len(row) > 1 else None
-        record = _format_graph_result(graph, node, score, "keyword", seen_ids)
+        data = _serialize_node(node)
+        memory_id = str(data.get("id")) if data.get("id") is not None else None
+        if memory_id and memory_id not in seen_ids:
+            nodes_and_scores.append((node, score))
+            memory_ids.append(memory_id)
+
+    # Bulk fetch relations to avoid N+1 queries
+    relations_map = _fetch_relations_bulk(graph, memory_ids, project_id)
+
+    # Format results with pre-fetched relations
+    matches: List[Dict[str, Any]] = []
+    for node, score in nodes_and_scores:
+        record = _format_graph_result(graph, node, score, "keyword", seen_ids, project_id, relations_map)
         if record is None:
             continue
         matches.append(record)
@@ -878,6 +841,7 @@ def _build_qdrant_tag_filter(
 
 def _vector_filter_only_tag_search(
     qdrant_client: Optional[QdrantClient],
+    project_id: str,
     tag_filters: Optional[List[str]],
     tag_mode: str,
     tag_match: str,
@@ -894,7 +858,7 @@ def _vector_filter_only_tag_search(
 
     try:
         points, _ = qdrant_client.scroll(
-            collection_name=COLLECTION_NAME,
+            collection_name=_ensure_project_collection(qdrant_client, project_id),
             scroll_filter=query_filter,
             limit=limit,
             with_payload=True,
@@ -938,6 +902,7 @@ def _vector_filter_only_tag_search(
 def _vector_search(
     qdrant_client: Optional[QdrantClient],
     graph: Any,
+    project_id: str,
     query_text: str,
     embedding_param: Optional[str],
     limit: int,
@@ -972,7 +937,7 @@ def _vector_search(
 
     try:
         vector_results = qdrant_client.search(
-            collection_name=COLLECTION_NAME,
+            collection_name=_ensure_project_collection(qdrant_client, project_id),
             query_vector=embedding,
             limit=limit,
             with_payload=True,
@@ -990,7 +955,7 @@ def _vector_search(
 
         seen_ids.add(memory_id)
         payload = hit.payload or {}
-        relations = _fetch_relations(graph, memory_id) if graph is not None else []
+        relations = _fetch_relations(graph, memory_id, project_id) if graph is not None else []
         score = float(hit.score) if hit.score is not None else 0.0
 
         matches.append(
@@ -1395,6 +1360,99 @@ def _extract_api_token() -> Optional[str]:
     return None
 
 
+def _extract_project_id() -> str:
+    """Extract project ID from request headers, defaulting to DEFAULT_PROJECT for backward compatibility."""
+    project_id = request.headers.get("X-Project-ID")
+    if project_id and isinstance(project_id, str):
+        project_id = project_id.strip()
+
+        # Normalize to ASCII to prevent Unicode bypass attacks
+        try:
+            project_id = project_id.encode('ascii').decode('ascii')
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            logger.warning("Project ID contains non-ASCII characters: %s, using default project", project_id)
+            return DEFAULT_PROJECT
+
+        if project_id:
+            # Block reserved prefix for system use
+            if project_id.startswith('__'):
+                logger.warning("Project ID cannot start with '__' (reserved): %s, using default project", project_id)
+                return DEFAULT_PROJECT
+
+            # Validate project ID format and constraints
+            if not re.match(r'^[a-zA-Z0-9_-]+$', project_id):
+                logger.warning("Invalid project ID format (must be alphanumeric, hyphens, underscores only): %s, using default project", project_id)
+                return DEFAULT_PROJECT
+
+            # Length constraints (Qdrant collection names have limits)
+            if len(project_id) > 63:
+                logger.warning("Project ID too long (max 63 chars): %s, using default project", project_id)
+                return DEFAULT_PROJECT
+
+            # Must start with alphanumeric character
+            if not re.match(r'^[a-zA-Z0-9]', project_id):
+                logger.warning("Project ID must start with alphanumeric character: %s, using default project", project_id)
+                return DEFAULT_PROJECT
+
+            # Reserved words that could conflict with system names
+            reserved_words = {'system', 'admin', 'root', 'api', 'health', 'status', 'test', 'tmp', 'temp'}
+            if project_id.lower() in reserved_words:
+                logger.warning("Project ID uses reserved word: %s, using default project", project_id)
+                return DEFAULT_PROJECT
+
+            # Prevent potential Qdrant collection conflicts
+            if project_id.endswith('_memories'):
+                logger.warning("Project ID cannot end with '_memories': %s, using default project", project_id)
+                return DEFAULT_PROJECT
+
+            return project_id
+        else:
+            logger.debug("Empty project ID after strip, using default project")
+
+    return DEFAULT_PROJECT
+
+
+def _get_project_collection_name(project_id: str) -> str:
+    """Get the Qdrant collection name for a project."""
+    if project_id == DEFAULT_PROJECT:
+        return COLLECTION_NAME  # Backward compatibility for unnamed project
+    return f"{project_id}_{COLLECTION_NAME}"
+
+
+def _ensure_project_collection(qdrant_client: QdrantClient, project_id: str) -> str:
+    """Ensure the project-specific Qdrant collection exists."""
+    collection_name = _get_project_collection_name(project_id)
+
+    try:
+        # Check if collection exists
+        collections = qdrant_client.get_collections()
+        existing_names = [c.name for c in collections.collections]
+
+        if collection_name not in existing_names:
+            logger.info("Creating Qdrant collection for project %s: %s", project_id, collection_name)
+            qdrant_client.create_collection(
+                collection_name=collection_name,
+                vectors_config=VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE),
+            )
+
+            # Set up payload indexing for efficient filtering
+            if PayloadSchemaType is not None:
+                qdrant_client.create_payload_index(
+                    collection_name=collection_name,
+                    field_name="tags",
+                    field_schema=PayloadSchemaType.KEYWORD,
+                )
+                qdrant_client.create_payload_index(
+                    collection_name=collection_name,
+                    field_name="importance",
+                    field_schema=PayloadSchemaType.FLOAT,
+                )
+    except Exception:
+        logger.exception("Failed to ensure collection %s exists", collection_name)
+
+    return collection_name
+
+
 def _require_admin_token() -> None:
     if not ADMIN_TOKEN:
         abort(403, description="Admin token not configured")
@@ -1563,6 +1621,41 @@ def init_falkordb() -> None:
         )
         state.memory_graph = state.falkordb.select_graph(GRAPH_NAME)
         logger.info("FalkorDB connection established")
+
+        # Create index on project_id for fast project-scoped queries
+        try:
+            state.memory_graph.query("CREATE INDEX FOR (m:Memory) ON (m.project_id)")
+            logger.info("Created project_id index on Memory nodes")
+        except Exception:
+            # Index might already exist, that's OK
+            logger.debug("project_id index already exists or failed to create")
+
+        # Migrate any NULL project_id values to DEFAULT_PROJECT for backward compatibility
+        try:
+            result = state.memory_graph.query("MATCH (m:Memory) WHERE m.project_id IS NULL RETURN COUNT(m) as count")
+            null_count = result.result_set[0][0] if result.result_set else 0
+
+            if null_count > 0:
+                logger.info("Migrating %d memories from NULL project_id to '%s'", null_count, DEFAULT_PROJECT)
+                state.memory_graph.query(
+                    "MATCH (m:Memory) WHERE m.project_id IS NULL SET m.project_id = $default_project",
+                    {"default_project": DEFAULT_PROJECT}
+                )
+                # Also migrate Pattern nodes if they exist
+                pattern_result = state.memory_graph.query("MATCH (p:Pattern) WHERE p.project_id IS NULL RETURN COUNT(p) as count")
+                pattern_count = pattern_result.result_set[0][0] if pattern_result.result_set else 0
+                if pattern_count > 0:
+                    logger.info("Migrating %d pattern nodes from NULL project_id to '%s'", pattern_count, DEFAULT_PROJECT)
+                    state.memory_graph.query(
+                        "MATCH (p:Pattern) WHERE p.project_id IS NULL SET p.project_id = $default_project",
+                        {"default_project": DEFAULT_PROJECT}
+                    )
+                logger.info("Migration completed successfully")
+            else:
+                logger.debug("No NULL project_id values found, migration not needed")
+        except Exception:
+            logger.exception("Failed to migrate NULL project_id values")
+
     except Exception:  # pragma: no cover - log full stack trace in production
         logger.exception("Failed to initialize FalkorDB connection")
         state.falkordb = None
@@ -2037,7 +2130,7 @@ def _store_embedding_in_qdrant(memory_id: str, content: str, embedding: List[flo
     if graph is None:
         return
     
-    # Fetch latest memory data from FalkorDB for payload
+    # Fetch latest memory data from FalkorDB for payload including project_id
     result = graph.query("MATCH (m:Memory {id: $id}) RETURN m", {"id": memory_id})
     if not getattr(result, "result_set", None):
         logger.warning("Memory %s not found in FalkorDB, skipping Qdrant update", memory_id)
@@ -2045,11 +2138,12 @@ def _store_embedding_in_qdrant(memory_id: str, content: str, embedding: List[flo
     
     node = result.result_set[0][0]
     properties = getattr(node, "properties", {})
+    project_id = properties.get("project_id")  # Can be None for unnamed project
     
     # Store in Qdrant
     try:
         qdrant_client.upsert(
-            collection_name=COLLECTION_NAME,
+            collection_name=_ensure_project_collection(qdrant_client, project_id),
             points=[
                 PointStruct(
                     id=memory_id,
@@ -2100,6 +2194,9 @@ def enrich_memory(memory_id: str, *, forced: bool = False) -> bool:
     if not isinstance(properties, dict):
         properties = dict(getattr(node, "__dict__", {}))
 
+    # Extract project_id for isolation (can be None for unnamed project)
+    project_id = properties.get("project_id")
+
     metadata_raw = properties.get("metadata")
     metadata = _parse_metadata_field(metadata_raw) or {}
     if not isinstance(metadata, dict):
@@ -2132,9 +2229,9 @@ def enrich_memory(memory_id: str, *, forced: bool = False) -> bool:
     if entity_tags:
         tags = list(dict.fromkeys(tags + sorted(entity_tags)))
 
-    temporal_links = find_temporal_relationships(graph, memory_id)
-    pattern_info = detect_patterns(graph, memory_id, content)
-    semantic_neighbors = link_semantic_neighbors(graph, memory_id)
+    temporal_links = find_temporal_relationships(graph, memory_id, project_id)
+    pattern_info = detect_patterns(graph, memory_id, content, project_id)
+    semantic_neighbors = link_semantic_neighbors(graph, memory_id, project_id)
 
     if ENRICHMENT_ENABLE_SUMMARIES:
         existing_summary = properties.get("summary")
@@ -2191,8 +2288,8 @@ def enrich_memory(memory_id: str, *, forced: bool = False) -> bool:
     return True
 
 
-def find_temporal_relationships(graph: Any, memory_id: str, limit: int = 5) -> int:
-    """Find and create temporal relationships with recent memories."""
+def find_temporal_relationships(graph: Any, memory_id: str, project_id: str, limit: int = 5) -> int:
+    """Find and create temporal relationships with recent memories in the same project."""
     created = 0
     try:
         result = graph.query(
@@ -2200,6 +2297,7 @@ def find_temporal_relationships(graph: Any, memory_id: str, limit: int = 5) -> i
             MATCH (m1:Memory {id: $id})
             MATCH (m2:Memory)
             WHERE m2.id <> $id
+                AND m2.project_id = $project_id
                 AND m2.timestamp IS NOT NULL
                 AND m1.timestamp IS NOT NULL
                 AND m2.timestamp < m1.timestamp
@@ -2207,7 +2305,7 @@ def find_temporal_relationships(graph: Any, memory_id: str, limit: int = 5) -> i
             ORDER BY m2.timestamp DESC
             LIMIT $limit
             """,
-            {"id": memory_id, "limit": limit}
+            {"id": memory_id, "project_id": project_id, "limit": limit}
         )
 
         timestamp = utc_now()
@@ -2231,8 +2329,8 @@ def find_temporal_relationships(graph: Any, memory_id: str, limit: int = 5) -> i
     return created
 
 
-def detect_patterns(graph: Any, memory_id: str, content: str) -> List[Dict[str, Any]]:
-    """Detect if this memory exemplifies or creates patterns."""
+def detect_patterns(graph: Any, memory_id: str, content: str, project_id: str) -> List[Dict[str, Any]]:
+    """Detect if this memory exemplifies or creates patterns within the same project."""
     detected: List[Dict[str, Any]] = []
 
     try:
@@ -2242,11 +2340,12 @@ def detect_patterns(graph: Any, memory_id: str, content: str) -> List[Dict[str, 
             MATCH (m:Memory)
             WHERE m.type = $type
                 AND m.id <> $id
+                AND m.project_id = $project_id
                 AND m.confidence > 0.5
             RETURN m.id, m.content
             LIMIT 10
             """,
-            {"type": memory_type, "id": memory_id}
+            {"type": memory_type, "id": memory_id, "project_id": project_id}
         )
 
         similar_texts = [content]
@@ -2268,9 +2367,10 @@ def detect_patterns(graph: Any, memory_id: str, content: str) -> List[Dict[str, 
                 + (f" highlighting {', '.join(top_terms)}" if top_terms else "")
             )
 
+            # Create or update project-scoped Pattern node
             graph.query(
                 """
-                MERGE (p:Pattern {type: $type})
+                MERGE (p:Pattern {type: $type, project_id: $project_id})
                 ON CREATE SET
                     p.id = $pattern_id,
                     p.content = $description,
@@ -2289,6 +2389,7 @@ def detect_patterns(graph: Any, memory_id: str, content: str) -> List[Dict[str, 
                 """,
                 {
                     "type": memory_type,
+                    "project_id": project_id,
                     "pattern_id": pattern_id,
                     "description": description,
                     "initial_confidence": 0.35,
@@ -2297,16 +2398,18 @@ def detect_patterns(graph: Any, memory_id: str, content: str) -> List[Dict[str, 
                 },
             )
 
+            # Link memory to Pattern node
             graph.query(
                 """
                 MATCH (m:Memory {id: $memory_id})
-                MATCH (p:Pattern {type: $type})
+                MATCH (p:Pattern {type: $type, project_id: $project_id})
                 MERGE (m)-[r:EXEMPLIFIES]->(p)
                 SET r.confidence = $confidence,
                     r.updated_at = $timestamp
                 """,
                 {
                     "type": memory_type,
+                    "project_id": project_id,
                     "memory_id": memory_id,
                     "confidence": confidence,
                     "timestamp": utc_now(),
@@ -2326,14 +2429,15 @@ def detect_patterns(graph: Any, memory_id: str, content: str) -> List[Dict[str, 
     return detected
 
 
-def link_semantic_neighbors(graph: Any, memory_id: str) -> List[Tuple[str, float]]:
+def link_semantic_neighbors(graph: Any, memory_id: str, project_id: str) -> List[Tuple[str, float]]:
+    """Link semantically similar memories within the same project using vector search."""
     client = get_qdrant_client()
-    if client is None:
+    if client is None or graph is None:
         return []
 
     try:
         points = client.retrieve(
-            collection_name=COLLECTION_NAME,
+            collection_name=_ensure_project_collection(client, project_id),
             ids=[memory_id],
             with_vectors=True,
             with_payload=False,
@@ -2349,7 +2453,7 @@ def link_semantic_neighbors(graph: Any, memory_id: str) -> List[Tuple[str, float
 
     try:
         neighbors = client.search(
-            collection_name=COLLECTION_NAME,
+            collection_name=_ensure_project_collection(client, project_id),
             query_vector=query_vector,
             limit=ENRICHMENT_SIMILARITY_LIMIT + 1,
             with_payload=False,
@@ -2489,14 +2593,14 @@ def admin_reembed() -> Any:
 
     # Query memories to reembed
     if force_reembed:
-        query = "MATCH (m:Memory) RETURN m.id, m.content ORDER BY m.timestamp DESC"
+        query = "MATCH (m:Memory) RETURN m.id, m.content, m.project_id ORDER BY m.timestamp DESC"
     else:
         # Only reembed memories that don't have real embeddings yet
         # We'll check by seeing if they have the default placeholder pattern
         query = """
             MATCH (m:Memory)
             WHERE m.content IS NOT NULL
-            RETURN m.id, m.content
+            RETURN m.id, m.content, m.project_id
             ORDER BY m.timestamp DESC
         """
 
@@ -2509,8 +2613,9 @@ def admin_reembed() -> Any:
     for row in result.result_set:
         memory_id = row[0]
         content = row[1]
+        project_id = row[2]  # Can be None for unnamed project
         if content:
-            memories_to_process.append((memory_id, content))
+            memories_to_process.append((memory_id, content, project_id))
 
     if not memories_to_process:
         return jsonify({
@@ -2520,99 +2625,109 @@ def admin_reembed() -> Any:
             "total": 0
         })
 
-    # Process in batches
+    # Group memories by project_id to handle collections properly
+    from collections import defaultdict
+    memories_by_project = defaultdict(list)
+
+    for memory_id, content, project_id in memories_to_process:
+        memories_by_project[project_id].append((memory_id, content))
+
+    # Process in batches by project
     processed = 0
     failed = 0
     failed_ids = []
 
-    for i in range(0, len(memories_to_process), batch_size):
-        batch = memories_to_process[i:i + batch_size]
-        points = []
+    for project_id, project_memories in memories_by_project.items():
+        project_collection = _ensure_project_collection(qdrant_client, project_id)
 
-        for memory_id, content in batch:
-            try:
-                # Generate real embedding using OpenAI
-                embedding = _generate_real_embedding(content)
+        for i in range(0, len(project_memories), batch_size):
+            batch = project_memories[i:i + batch_size]
+            points = []
 
-                # Retrieve existing metadata from Qdrant if available
+            for memory_id, content in batch:
                 try:
-                    existing = qdrant_client.retrieve(
-                        collection_name=COLLECTION_NAME,
+                    # Generate real embedding using OpenAI
+                    embedding = _generate_real_embedding(content)
+
+                    # Retrieve existing metadata from Qdrant if available
+                    try:
+                        existing = qdrant_client.retrieve(
+                        collection_name=project_collection,
                         ids=[memory_id],
                         with_payload=True
                     )
-                    if existing:
-                        payload_data = existing[0].payload
-                    else:
-                        # Fallback: query from graph for metadata
-                        meta_result = graph.query(
-                            "MATCH (m:Memory {id: $id}) RETURN m",
-                            {"id": memory_id}
-                        )
-                        if meta_result.result_set:
-                            node = meta_result.result_set[0][0]
-                            props = _serialize_node(node)
-                            payload_data = {
-                                "content": content,
-                                "tags": props.get("tags", []),
-                                "importance": props.get("importance", 0.5),
-                                "timestamp": props.get("timestamp"),
-                            "type": props.get("type", "Context"),  # Default to Context instead of Memory
-                            "confidence": props.get("confidence", 0.6),
-                                "updated_at": props.get("updated_at"),
-                                "last_accessed": props.get("last_accessed"),
-                                "metadata": props.get("metadata", {}),
-                            }
+                        if existing:
+                            payload_data = existing[0].payload
                         else:
-                            payload_data = {
-                                "content": content,
-                                "tags": [],
-                                "importance": 0.5,
-                                "timestamp": utc_now(),
-                                "type": "Context",
-                                "confidence": 0.6,
-                                "metadata": {},
-                            }
-                except Exception as e:
-                    logger.warning(f"Failed to retrieve metadata for {memory_id}: {e}")
-                    # Use minimal payload
-                    payload_data = {
-                        "content": content,
-                        "tags": [],
-                        "importance": 0.5,
-                        "timestamp": utc_now(),
-                        "type": "Context",
-                        "confidence": 0.6,
-                        "metadata": {},
-                    }
+                            # Fallback: query from graph for metadata
+                            meta_result = graph.query(
+                                "MATCH (m:Memory {id: $id}) RETURN m",
+                                {"id": memory_id}
+                            )
+                            if meta_result.result_set:
+                                node = meta_result.result_set[0][0]
+                                props = _serialize_node(node)
+                                payload_data = {
+                                    "content": content,
+                                    "tags": props.get("tags", []),
+                                    "importance": props.get("importance", 0.5),
+                                    "timestamp": props.get("timestamp"),
+                                    "type": props.get("type", "Context"),  # Default to Context instead of Memory
+                                    "confidence": props.get("confidence", 0.6),
+                                    "updated_at": props.get("updated_at"),
+                                    "last_accessed": props.get("last_accessed"),
+                                    "metadata": props.get("metadata", {}),
+                                }
+                            else:
+                                payload_data = {
+                                    "content": content,
+                                    "tags": [],
+                                    "importance": 0.5,
+                                    "timestamp": utc_now(),
+                                    "type": "Context",
+                                    "confidence": 0.6,
+                                    "metadata": {},
+                                }
+                    except Exception as e:
+                        logger.warning(f"Failed to retrieve metadata for {memory_id}: {e}")
+                        # Use minimal payload
+                        payload_data = {
+                            "content": content,
+                            "tags": [],
+                            "importance": 0.5,
+                            "timestamp": utc_now(),
+                            "type": "Context",
+                            "confidence": 0.6,
+                            "metadata": {},
+                        }
 
-                points.append(
-                    PointStruct(
-                        id=memory_id,
-                        vector=embedding,
-                        payload=payload_data
+                    points.append(
+                        PointStruct(
+                            id=memory_id,
+                            vector=embedding,
+                            payload=payload_data
+                        )
                     )
-                )
-                processed += 1
+                    processed += 1
 
-            except Exception as e:
-                logger.error(f"Failed to generate embedding for memory {memory_id}: {e}")
-                failed += 1
-                failed_ids.append(memory_id)
+                except Exception as e:
+                    logger.error(f"Failed to generate embedding for memory {memory_id}: {e}")
+                    failed += 1
+                    failed_ids.append(memory_id)
 
-        # Batch upsert to Qdrant
-        if points:
-            try:
-                qdrant_client.upsert(
-                    collection_name=COLLECTION_NAME,
-                    points=points
-                )
-                logger.info(f"Successfully reembedded batch of {len(points)} memories")
-            except Exception as e:
-                logger.error(f"Failed to upsert batch to Qdrant: {e}")
-                failed += len(points)
-                failed_ids.extend([p.id for p in points])
-                processed -= len(points)
+            # Batch upsert to Qdrant
+            if points:
+                try:
+                    qdrant_client.upsert(
+                        collection_name=project_collection,
+                        points=points
+                    )
+                    logger.info(f"Successfully reembedded batch of {len(points)} memories")
+                except Exception as e:
+                    logger.error(f"Failed to upsert batch to Qdrant: {e}")
+                    failed += len(points)
+                    failed_ids.extend([p.id for p in points])
+                    processed -= len(points)
 
     response = {
         "status": "complete",
@@ -2691,6 +2806,8 @@ def store_memory() -> Any:
     content = (payload.get("content") or "").strip()
     if not content:
         abort(400, description="'content' is required")
+
+    project_id = _extract_project_id()
 
     tags = _normalize_tags(payload.get("tags"))
     tags_lower = [t.strip().lower() for t in tags if isinstance(t, str) and t.strip()]
@@ -2778,7 +2895,8 @@ def store_memory() -> Any:
         graph.query(
             """
             MERGE (m:Memory {id: $id})
-            SET m.content = $content,
+            SET m.project_id = $project_id,
+                m.content = $content,
                 m.timestamp = $timestamp,
                 m.importance = $importance,
                 m.tags = $tags,
@@ -2795,6 +2913,7 @@ def store_memory() -> Any:
             """,
             {
                 "id": memory_id,
+                "project_id": project_id,
                 "content": content,
                 "timestamp": created_at,
                 "importance": importance,
@@ -2826,8 +2945,9 @@ def store_memory() -> Any:
         qdrant_result = None
         if qdrant_client is not None:
             try:
+                collection_name = _ensure_project_collection(qdrant_client, project_id)
                 qdrant_client.upsert(
-                    collection_name=COLLECTION_NAME,
+                    collection_name=collection_name,
                     points=[
                         PointStruct(
                             id=memory_id,
@@ -2896,6 +3016,7 @@ def store_memory() -> Any:
 
 @app.route("/memory/<memory_id>", methods=["PATCH"])
 def update_memory(memory_id: str) -> Any:
+    project_id = _extract_project_id()
     payload = request.get_json(silent=True)
     if not isinstance(payload, dict):
         abort(400, description="JSON body is required")
@@ -2904,7 +3025,7 @@ def update_memory(memory_id: str) -> Any:
     if graph is None:
         abort(503, description="FalkorDB is unavailable")
 
-    result = graph.query("MATCH (m:Memory {id: $id}) RETURN m", {"id": memory_id})
+    result = graph.query("MATCH (m:Memory {id: $id, project_id: $project_id}) RETURN m", {"id": memory_id, "project_id": project_id})
     if not getattr(result, "result_set", None):
         abort(404, description="Memory not found")
 
@@ -2950,7 +3071,7 @@ def update_memory(memory_id: str) -> Any:
             abort(400, description=f"Invalid last_accessed: {exc}")
 
     update_query = """
-        MATCH (m:Memory {id: $id})
+        MATCH (m:Memory {id: $id, project_id: $project_id})
         SET m.content = $content,
             m.tags = $tags,
             m.tag_prefixes = $tag_prefixes,
@@ -2968,6 +3089,7 @@ def update_memory(memory_id: str) -> Any:
         update_query,
         {
             "id": memory_id,
+            "project_id": project_id,
             "content": new_content,
             "tags": tags,
             "tag_prefixes": tag_prefixes,
@@ -2989,7 +3111,7 @@ def update_memory(memory_id: str) -> Any:
         else:
             try:
                 existing = qdrant_client.retrieve(
-                    collection_name=COLLECTION_NAME,
+                    collection_name=_ensure_project_collection(qdrant_client, project_id),
                     ids=[memory_id],
                     with_vectors=True,
                 )
@@ -3013,7 +3135,7 @@ def update_memory(memory_id: str) -> Any:
                 "metadata": metadata,
             }
             qdrant_client.upsert(
-                collection_name=COLLECTION_NAME,
+                collection_name=_ensure_project_collection(qdrant_client, project_id),
                 points=[PointStruct(id=memory_id, vector=vector, payload=payload)],
             )
 
@@ -3022,15 +3144,16 @@ def update_memory(memory_id: str) -> Any:
 
 @app.route("/memory/<memory_id>", methods=["DELETE"])
 def delete_memory(memory_id: str) -> Any:
+    project_id = _extract_project_id()
     graph = get_memory_graph()
     if graph is None:
         abort(503, description="FalkorDB is unavailable")
 
-    result = graph.query("MATCH (m:Memory {id: $id}) RETURN m", {"id": memory_id})
+    result = graph.query("MATCH (m:Memory {id: $id, project_id: $project_id}) RETURN m", {"id": memory_id, "project_id": project_id})
     if not getattr(result, "result_set", None):
         abort(404, description="Memory not found")
 
-    graph.query("MATCH (m:Memory {id: $id}) DETACH DELETE m", {"id": memory_id})
+    graph.query("MATCH (m:Memory {id: $id, project_id: $project_id}) DETACH DELETE m", {"id": memory_id, "project_id": project_id})
 
     qdrant_client = get_qdrant_client()
     if qdrant_client is not None:
@@ -3039,7 +3162,7 @@ def delete_memory(memory_id: str) -> Any:
                 selector = qdrant_models.PointIdsList(points=[memory_id])
             else:
                 selector = {"points": [memory_id]}
-            qdrant_client.delete(collection_name=COLLECTION_NAME, points_selector=selector)
+            qdrant_client.delete(collection_name=_ensure_project_collection(qdrant_client, project_id), points_selector=selector)
         except Exception:
             logger.exception("Failed to delete vector for memory %s", memory_id)
 
@@ -3048,6 +3171,7 @@ def delete_memory(memory_id: str) -> Any:
 
 @app.route("/memory/by-tag", methods=["GET"])
 def memories_by_tag() -> Any:
+    project_id = _extract_project_id()
     raw_tags = request.args.getlist("tags") or request.args.get("tags")
     tags = _normalize_tag_list(raw_tags)
     if not tags:
@@ -3062,11 +3186,13 @@ def memories_by_tag() -> Any:
     params = {
         "tags": [tag.lower() for tag in tags],
         "limit": limit,
+        "project_id": project_id,
     }
 
     query = """
         MATCH (m:Memory)
-        WHERE ANY(tag IN coalesce(m.tags, []) WHERE toLower(tag) IN $tags)
+        WHERE m.project_id = $project_id
+          AND ANY(tag IN coalesce(m.tags, []) WHERE toLower(tag) IN $tags)
         RETURN m
         ORDER BY m.importance DESC, m.timestamp DESC
         LIMIT $limit
@@ -3090,6 +3216,7 @@ def memories_by_tag() -> Any:
 @app.route("/recall", methods=["GET"])
 def recall_memories() -> Any:
     query_start = time.perf_counter()
+    project_id = _extract_project_id()
     query_text = (request.args.get("query") or "").strip()
     limit = max(1, min(int(request.args.get("limit", 5)), 50))
     embedding_param = request.args.get("embedding")
@@ -3135,6 +3262,7 @@ def recall_memories() -> Any:
         vector_matches = _vector_search(
             qdrant_client,
             graph,
+            project_id,
             query_text,
             embedding_param,
             limit,
@@ -3156,6 +3284,7 @@ def recall_memories() -> Any:
     if remaining_slots and graph is not None:
         graph_matches = _graph_keyword_search(
             graph,
+            project_id,
             query_text,
             remaining_slots,
             seen_ids,
@@ -3180,6 +3309,7 @@ def recall_memories() -> Any:
     ):
         tag_only_results = _vector_filter_only_tag_search(
             qdrant_client,
+            project_id,
             tag_filters,
             tag_mode,
             tag_match,
@@ -3275,6 +3405,9 @@ def create_association() -> Any:
     if graph is None:
         abort(503, description="FalkorDB is unavailable")
 
+    # Extract project ID for validation
+    project_id = _extract_project_id()
+
     timestamp = utc_now()
 
     # Build relationship properties based on type
@@ -3295,10 +3428,13 @@ def create_association() -> Any:
     set_clause = ", ".join(set_clauses)
 
     try:
+        # Use NULL-safe matching for project_id
         result = graph.query(
             f"""
             MATCH (m1:Memory {{id: $id1}})
             MATCH (m2:Memory {{id: $id2}})
+            WHERE m1.project_id = $project_id
+              AND m2.project_id = $project_id
             MERGE (m1)-[r:{relation_type}]->(m2)
             SET {set_clause}
             RETURN r
@@ -3306,6 +3442,7 @@ def create_association() -> Any:
             {
                 "id1": memory1_id,
                 "id2": memory2_id,
+                "project_id": project_id,
                 **relationship_props,
             },
         )
@@ -3314,7 +3451,7 @@ def create_association() -> Any:
         abort(500, description="Failed to create association")
 
     if not result.result_set:
-        abort(404, description="One or both memories do not exist")
+        abort(404, description=f"One or both memories do not exist or do not belong to project '{project_id}'")
 
     response = {
         "status": "success",
@@ -3337,6 +3474,7 @@ def consolidate_memories() -> Any:
     data = request.get_json() or {}
     mode = data.get('mode', 'full')
     dry_run = data.get('dry_run', True)
+    project_id = _extract_project_id()
 
     graph = get_memory_graph()
     if graph is None:
@@ -3347,7 +3485,7 @@ def consolidate_memories() -> Any:
     try:
         vector_store = get_qdrant_client()
         consolidator = MemoryConsolidator(graph, vector_store)
-        results = consolidator.consolidate(mode=mode, dry_run=dry_run)
+        results = consolidator.consolidate_project(project_id=project_id, mode=mode, dry_run=dry_run)
 
         if not dry_run:
             _persist_consolidation_run(graph, results)
@@ -3395,6 +3533,7 @@ def consolidation_status() -> Any:
 @app.route("/startup-recall", methods=["GET"])
 def startup_recall() -> Any:
     """Recall critical lessons at session startup."""
+    project_id = _extract_project_id()
     graph = get_memory_graph()
     if graph is None:
         abort(503, description="FalkorDB is unavailable")
@@ -3403,14 +3542,15 @@ def startup_recall() -> Any:
         # Search for critical lessons and system rules
         lesson_query = """
             MATCH (m:Memory)
-            WHERE 'critical' IN m.tags OR 'lesson' IN m.tags OR 'ai-assistant' IN m.tags
+            WHERE m.project_id = $project_id
+              AND ('critical' IN m.tags OR 'lesson' IN m.tags OR 'ai-assistant' IN m.tags)
             RETURN m.id as id, m.content as content, m.tags as tags,
                    m.importance as importance, m.type as type, m.metadata as metadata
             ORDER BY m.importance DESC
             LIMIT 10
         """
 
-        lesson_results = graph.query(lesson_query)
+        lesson_results = graph.query(lesson_query, {"project_id": project_id})
         lessons = []
 
         if lesson_results.result_set:
@@ -3427,12 +3567,13 @@ def startup_recall() -> Any:
         # Get system rules
         system_query = """
             MATCH (m:Memory)
-            WHERE 'system' IN m.tags OR 'memory-recall' IN m.tags
+            WHERE m.project_id = $project_id
+              AND ('system' IN m.tags OR 'memory-recall' IN m.tags)
             RETURN m.id as id, m.content as content, m.tags as tags
             LIMIT 5
         """
 
-        system_results = graph.query(system_query)
+        system_results = graph.query(system_query, {"project_id": project_id})
         system_rules = []
 
         if system_results.result_set:
@@ -3466,6 +3607,7 @@ def startup_recall() -> Any:
 def analyze_memories() -> Any:
     """Analyze memory patterns, preferences, and insights."""
     query_start = time.perf_counter()
+    project_id = _extract_project_id()
     graph = get_memory_graph()
     if graph is None:
         abort(503, description="FalkorDB is unavailable")
@@ -3484,10 +3626,12 @@ def analyze_memories() -> Any:
         type_result = graph.query(
             """
             MATCH (m:Memory)
-            WHERE m.type IS NOT NULL
+            WHERE m.project_id = $project_id
+              AND m.type IS NOT NULL
             RETURN m.type, COUNT(m) as count, AVG(m.confidence) as avg_confidence
             ORDER BY count DESC
-            """
+            """,
+            {"project_id": project_id}
         )
 
         for mem_type, count, avg_conf in type_result.result_set:
@@ -3500,11 +3644,13 @@ def analyze_memories() -> Any:
         pattern_result = graph.query(
             """
             MATCH (p:Pattern)
-            WHERE p.confidence > 0.6
+            WHERE p.project_id = $project_id
+              AND p.confidence > 0.6
             RETURN p.type, p.content, p.confidence, p.observations
             ORDER BY p.confidence DESC
             LIMIT 10
-            """
+            """,
+            {"project_id": project_id}
         )
 
         for p_type, content, confidence, observations in pattern_result.result_set:
@@ -3518,11 +3664,12 @@ def analyze_memories() -> Any:
         # Find preferences (PREFERS_OVER relationships)
         pref_result = graph.query(
             """
-            MATCH (m1:Memory)-[r:PREFERS_OVER]->(m2:Memory)
+            MATCH (m1:Memory {project_id: $project_id})-[r:PREFERS_OVER]->(m2:Memory {project_id: $project_id})
             RETURN m1.content, m2.content, r.context, r.strength
             ORDER BY r.strength DESC
             LIMIT 10
-            """
+            """,
+            {"project_id": project_id}
         )
 
         for preferred, over, context, strength in pref_result.result_set:
@@ -3538,10 +3685,12 @@ def analyze_memories() -> Any:
             temporal_result = graph.query(
                 """
                 MATCH (m:Memory)
-                WHERE m.timestamp IS NOT NULL
+                WHERE m.project_id = $project_id
+                  AND m.timestamp IS NOT NULL
                 RETURN m.timestamp, m.importance
                 LIMIT 100
-                """
+                """,
+                {"project_id": project_id}
             )
 
             # Process temporal data in Python
@@ -3572,7 +3721,8 @@ def analyze_memories() -> Any:
         conf_result = graph.query(
             """
             MATCH (m:Memory)
-            WHERE m.confidence IS NOT NULL
+            WHERE m.project_id = $project_id
+              AND m.confidence IS NOT NULL
             RETURN
                 CASE
                     WHEN m.confidence < 0.3 THEN 'low'
@@ -3580,7 +3730,8 @@ def analyze_memories() -> Any:
                     ELSE 'high'
                 END as level,
                 COUNT(m) as count
-            """
+            """,
+            {"project_id": project_id}
         )
 
         for level, count in conf_result.result_set:
@@ -3590,10 +3741,12 @@ def analyze_memories() -> Any:
         entity_result = graph.query(
             """
             MATCH (m:Memory)
-            WHERE m.content IS NOT NULL
+            WHERE m.project_id = $project_id
+              AND m.content IS NOT NULL
             RETURN m.content
             LIMIT 100
-            """
+            """,
+            {"project_id": project_id}
         )
 
         entity_counts: Dict[str, Dict[str, int]] = {
@@ -3765,16 +3918,16 @@ def _summarize_relation_node(data: Dict[str, Any]) -> Dict[str, Any]:
     return summary
 
 
-def _fetch_relations(graph: Any, memory_id: str) -> List[Dict[str, Any]]:
+def _fetch_relations(graph: Any, memory_id: str, project_id: str) -> List[Dict[str, Any]]:
     try:
         records = graph.query(
             """
-            MATCH (m:Memory {id: $id})-[r]->(related:Memory)
+            MATCH (m:Memory {id: $id, project_id: $project_id})-[r]->(related:Memory {project_id: $project_id})
             RETURN type(r) as relation_type, r.strength as strength, related
             ORDER BY coalesce(r.updated_at, related.timestamp) DESC
             LIMIT $limit
             """,
-            {"id": memory_id, "limit": RECALL_RELATION_LIMIT},
+            {"id": memory_id, "project_id": project_id, "limit": RECALL_RELATION_LIMIT},
         )
     except Exception:  # pragma: no cover - log full stack trace in production
         logger.exception("Failed to fetch relations for memory %s", memory_id)
@@ -3790,6 +3943,41 @@ def _fetch_relations(graph: Any, memory_id: str) -> List[Dict[str, Any]]:
             }
         )
     return connections
+
+
+def _fetch_relations_bulk(graph: Any, memory_ids: List[str], project_id: str) -> Dict[str, List[Dict[str, Any]]]:
+    """Fetch relations for multiple memories in a single query to avoid N+1 problem."""
+    if not memory_ids:
+        return {}
+
+    try:
+        records = graph.query(
+            """
+            MATCH (m:Memory)-[r]->(related:Memory)
+            WHERE m.id IN $ids
+              AND m.project_id = $project_id
+              AND related.project_id = $project_id
+            RETURN m.id as memory_id, type(r) as relation_type, r.strength as strength, related
+            ORDER BY m.id, coalesce(r.updated_at, related.timestamp) DESC
+            """,
+            {"ids": memory_ids, "project_id": project_id},
+        )
+    except Exception:  # pragma: no cover
+        logger.exception("Failed to bulk fetch relations")
+        return {mid: [] for mid in memory_ids}
+
+    # Group relations by memory_id
+    relations_map: Dict[str, List[Dict[str, Any]]] = {mid: [] for mid in memory_ids}
+    for memory_id, relation_type, strength, related in records.result_set:
+        if len(relations_map[memory_id]) < RECALL_RELATION_LIMIT:
+            relations_map[memory_id].append(
+                {
+                    "type": relation_type,
+                    "strength": strength,
+                    "memory": _summarize_relation_node(_serialize_node(related)),
+                }
+            )
+    return relations_map
 
 
 if __name__ == "__main__":

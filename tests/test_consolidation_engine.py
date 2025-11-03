@@ -7,6 +7,7 @@ import pytest
 
 import consolidation as consolidation_module
 from consolidation import MemoryConsolidator
+from app import DEFAULT_PROJECT
 
 
 class FakeResult:
@@ -45,7 +46,7 @@ class FakeGraph:
             rows = self.sample_rows if limit is None else self.sample_rows[: limit]
             return FakeResult(rows)
 
-        if "WHERE m.embeddings IS NOT NULL" in query:
+        if "WHERE m.project_id = $project_id" in query and "m.embeddings IS NOT NULL" in query:
             return FakeResult(self.cluster_rows)
 
         if "m.relevance_score as old_score" in query:
@@ -130,7 +131,7 @@ def test_discover_creative_associations_builds_connections() -> None:
     ]
 
     consolidator = MemoryConsolidator(graph)
-    associations = consolidator.discover_creative_associations(sample_size=3)
+    associations = consolidator.discover_creative_associations(project_id=DEFAULT_PROJECT, sample_size=3)
 
     assert any(item["type"] == "CONTRASTS_WITH" for item in associations)
 
@@ -144,7 +145,7 @@ def test_cluster_similar_memories_groups_items() -> None:
     ]
 
     consolidator = MemoryConsolidator(graph)
-    clusters = consolidator.cluster_similar_memories()
+    clusters = consolidator.cluster_similar_memories(project_id=DEFAULT_PROJECT)
 
     assert clusters
     assert clusters[0]["size"] == 3
@@ -189,7 +190,7 @@ def test_apply_controlled_forgetting_dry_run() -> None:
     graph.forgetting_rows = build_forgetting_rows()
 
     consolidator = MemoryConsolidator(graph)
-    stats = consolidator.apply_controlled_forgetting(dry_run=True)
+    stats = consolidator.apply_controlled_forgetting(project_id=DEFAULT_PROJECT, dry_run=True)
 
     assert stats["examined"] == 3
     assert stats["preserved"] == 1
@@ -206,7 +207,7 @@ def test_apply_controlled_forgetting_updates_graph_and_vector_store() -> None:
     vector_store = FakeVectorStore()
     consolidator = MemoryConsolidator(graph, vector_store=vector_store)
 
-    stats = consolidator.apply_controlled_forgetting(dry_run=False)
+    stats = consolidator.apply_controlled_forgetting(project_id=DEFAULT_PROJECT, dry_run=False)
 
     assert stats["preserved"] == 1
     assert graph.updated_scores  # recent memory updated in graph
@@ -228,7 +229,7 @@ def test_apply_decay_updates_scores() -> None:
     ]
 
     consolidator = MemoryConsolidator(graph)
-    stats = consolidator._apply_decay()
+    stats = consolidator._apply_decay(project_id=DEFAULT_PROJECT)
 
     assert stats["processed"] == 2
     assert len(graph.updated_scores) == 2

@@ -14,3 +14,6 @@ backups/
 # Log files
 *.log
 
+# Cloned MCP client repository (for development)
+mcp-client/
+
