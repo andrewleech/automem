@@ -3218,7 +3218,18 @@ def recall_memories() -> Any:
     query_start = time.perf_counter()
     project_id = _extract_project_id()
     query_text = (request.args.get("query") or "").strip()
-    limit = max(1, min(int(request.args.get("limit", 5)), 50))
+
+    # Default limit is 5, with a cap of 50
+    # Allow override via X-Max-Results header up to 500
+    default_limit = max(1, min(int(request.args.get("limit", 5)), 50))
+    max_results_header = request.headers.get("X-Max-Results")
+    if max_results_header:
+        try:
+            limit = max(1, min(int(max_results_header), 500))
+        except (ValueError, TypeError):
+            limit = default_limit
+    else:
+        limit = default_limit
     embedding_param = request.args.get("embedding")
     time_query = request.args.get("time_query") or request.args.get("time")
     start_param = request.args.get("start")
