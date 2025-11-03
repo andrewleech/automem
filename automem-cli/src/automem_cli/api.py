@@ -58,7 +58,8 @@ class AutoMemClient:
         payload = {"content": content}
 
         if memory_type:
-            payload["type"] = memory_type
+            # Capitalize memory type for server (expects: Context, Decision, etc.)
+            payload["type"] = memory_type.capitalize()
         if importance is not None:
             payload["importance"] = importance
         if tags:
