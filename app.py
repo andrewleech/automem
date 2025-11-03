@@ -2891,43 +2891,54 @@ def store_memory() -> Any:
     else:
         last_accessed = updated_at
 
+    # Build SET clause conditionally (FalkorDB doesn't allow null property values)
+    set_clauses = [
+        "m.project_id = $project_id",
+        "m.content = $content",
+        "m.timestamp = $timestamp",
+        "m.importance = $importance",
+        "m.tags = $tags",
+        "m.tag_prefixes = $tag_prefixes",
+        "m.type = $type",
+        "m.confidence = $confidence",
+        "m.t_valid = $t_valid",
+        "m.updated_at = $updated_at",
+        "m.last_accessed = $last_accessed",
+        "m.metadata = $metadata",
+        "m.processed = false"
+    ]
+
+    # Only set t_invalid if provided (null not allowed in FalkorDB MERGE)
+    if t_invalid is not None:
+        set_clauses.insert(9, "m.t_invalid = $t_invalid")
+
+    query = f"""
+        MERGE (m:Memory {{id: $id}})
+        SET {', '.join(set_clauses)}
+        RETURN m
+    """
+
+    params = {
+        "id": memory_id,
+        "project_id": project_id,
+        "content": content,
+        "timestamp": created_at,
+        "importance": importance,
+        "tags": tags,
+        "tag_prefixes": tag_prefixes,
+        "type": memory_type,
+        "confidence": type_confidence,
+        "t_valid": t_valid or created_at,
+        "updated_at": updated_at,
+        "last_accessed": last_accessed,
+        "metadata": metadata_json,
+    }
+
+    if t_invalid is not None:
+        params["t_invalid"] = t_invalid
+
     try:
-        graph.query(
-            """
-            MERGE (m:Memory {id: $id})
-            SET m.project_id = $project_id,
-                m.content = $content,
-                m.timestamp = $timestamp,
-                m.importance = $importance,
-                m.tags = $tags,
-                m.tag_prefixes = $tag_prefixes,
-                m.type = $type,
-                m.confidence = $confidence,
-                m.t_valid = $t_valid,
-                m.t_invalid = $t_invalid,
-                m.updated_at = $updated_at,
-                m.last_accessed = $last_accessed,
-                m.metadata = $metadata,
-                m.processed = false
-            RETURN m
-            """,
-            {
-                "id": memory_id,
-                "project_id": project_id,
-                "content": content,
-                "timestamp": created_at,
-                "importance": importance,
-                "tags": tags,
-                "tag_prefixes": tag_prefixes,
-                "type": memory_type,
-                "confidence": type_confidence,
-                "t_valid": t_valid or created_at,
-                "t_invalid": t_invalid,
-                "updated_at": updated_at,
-                "last_accessed": last_accessed,
-                "metadata": metadata_json,
-            },
-        )
+        graph.query(query, params)
     except Exception:  # pragma: no cover - log full stack trace in production
         logger.exception("Failed to persist memory in FalkorDB")
         abort(500, description="Failed to store memory in FalkorDB")
