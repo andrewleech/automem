@@ -209,3 +209,31 @@ class AutoMemClient:
         response = self.client.get("/startup-recall")
         response.raise_for_status()
         return response.json()
+
+    def list_projects(self) -> dict[str, Any]:
+        """List all projects with memory counts
+
+        Returns:
+            Dict with 'projects' list containing project info
+        """
+        response = self.client.get("/projects")
+        response.raise_for_status()
+        return response.json()
+
+    def clear_project(self, project_id: str, admin_token: str) -> dict[str, Any]:
+        """Clear all data for a specific project
+
+        Args:
+            project_id: Project identifier to clear
+            admin_token: Admin API token for authorization
+
+        Returns:
+            Dict with deletion stats
+        """
+        response = self.client.delete(
+            f"/projects/{project_id}",
+            params={"confirm": "yes"},
+            headers={"X-Admin-Token": admin_token}
+        )
+        response.raise_for_status()
+        return response.json()

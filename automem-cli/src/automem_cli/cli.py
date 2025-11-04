@@ -809,5 +809,276 @@ def relate(ctx, json_mode, memory1_id, memory2_id, relation_type, strength):
         sys.exit(1)
 
 
+@main.command()
+@click.option("--json", "json_mode", is_flag=True, help="Output JSON")
+@click.pass_context
+def projects(ctx, json_mode):
+    """List all projects with memory counts
+
+    Example:
+        am projects
+        am projects --json
+    """
+    client = ctx.obj["client"]
+    if not json_mode:
+        json_mode = ctx.obj["json_mode"]
+
+    try:
+        result = client.list_projects()
+
+        if json_mode:
+            output_json(result)
+        else:
+            projects_list = result.get("projects", [])
+            if not projects_list:
+                output_info("No projects found")
+                return
+
+            output_success(f"Found {len(projects_list)} project(s):")
+            for proj in projects_list:
+                output_info(f"\n📁 {proj['id']}")
+                output_info(f"   Memories: {proj['memory_count']}")
+                output_info(f"   Patterns: {proj['pattern_count']}")
+                has_qdrant = proj.get('has_qdrant_collection')
+                if has_qdrant is True:
+                    output_info(f"   Qdrant: ✓")
+                elif has_qdrant is False:
+                    output_info(f"   Qdrant: ✗")
+                else:
+                    output_info(f"   Qdrant: ?")
+
+    except httpx.HTTPStatusError as e:
+        if json_mode:
+            output_json({"error": str(e), "status_code": e.response.status_code})
+        else:
+            output_error(f"HTTP {e.response.status_code}: {e.response.text}")
+        sys.exit(1)
+    except Exception as e:
+        if json_mode:
+            output_json({"error": str(e)})
+        else:
+            output_error(str(e))
+        sys.exit(1)
+
+
+@main.command()
+@click.argument("project_id", required=False)
+@click.option("--backup-dir", default="./backups", help="Backup directory")
+@click.option("--json", "json_mode", is_flag=True, help="Output JSON")
+@click.pass_context
+def backup(ctx, project_id, backup_dir, json_mode):
+    """Backup project data to compressed files
+
+    Backs up FalkorDB graph and Qdrant vectors to timestamped files.
+    If project_id provided, filters to that project only.
+
+    Example:
+        am backup thread --backup-dir ./my-backups
+        am backup --json
+    """
+    import subprocess
+    from pathlib import Path
+
+    config = ctx.obj["config"]
+    if not json_mode:
+        json_mode = ctx.obj["json_mode"]
+
+    # Use project_id from argument or fall back to config
+    if not project_id:
+        project_id = config.project_id
+
+    try:
+        # Build command for backup script
+        script_path = Path(__file__).parent.parent.parent.parent / "scripts" / "backup_automem.py"
+        if not script_path.exists():
+            # Try relative to cwd
+            script_path = Path("scripts/backup_automem.py")
+            if not script_path.exists():
+                raise FileNotFoundError("Could not find backup_automem.py script")
+
+        cmd = ["python3", str(script_path), "--backup-dir", backup_dir]
+
+        if not json_mode:
+            output_info(f"Backing up project '{project_id}' to {backup_dir}...")
+
+        # Run backup script
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+
+        if json_mode:
+            # Parse JSON output from script
+            import json
+            try:
+                backup_result = json.loads(result.stdout.strip().split('\n')[-1])
+                output_json(backup_result)
+            except json.JSONDecodeError:
+                output_json({"status": "success", "output": result.stdout})
+        else:
+            output_success(f"Backup completed for project '{project_id}'")
+            output_info(result.stdout)
+
+    except subprocess.CalledProcessError as e:
+        if json_mode:
+            output_json({"error": str(e), "stderr": e.stderr})
+        else:
+            output_error(f"Backup failed: {e.stderr}")
+        sys.exit(1)
+    except Exception as e:
+        if json_mode:
+            output_json({"error": str(e)})
+        else:
+            output_error(str(e))
+        sys.exit(1)
+
+
+@main.command()
+@click.argument("falkordb_backup")
+@click.option("--qdrant-backup", help="Qdrant backup file")
+@click.option("--project-id", help="Filter to specific project")
+@click.option("--dry-run", is_flag=True, help="Validate without restoring")
+@click.option("--json", "json_mode", is_flag=True, help="Output JSON")
+@click.pass_context
+def restore(ctx, falkordb_backup, qdrant_backup, project_id, dry_run, json_mode):
+    """Restore project data from backup files
+
+    Example:
+        am restore backups/falkordb/falkordb_20251104_121225.json.gz \\
+                   --qdrant-backup backups/qdrant/qdrant_20251104_121225.json.gz \\
+                   --project-id thread
+        am restore --latest --dry-run
+    """
+    import subprocess
+    from pathlib import Path
+
+    if not json_mode:
+        json_mode = ctx.obj["json_mode"]
+
+    try:
+        # Build command for restore script
+        script_path = Path(__file__).parent.parent.parent.parent / "scripts" / "restore_automem.py"
+        if not script_path.exists():
+            # Try relative to cwd
+            script_path = Path("scripts/restore_automem.py")
+            if not script_path.exists():
+                raise FileNotFoundError("Could not find restore_automem.py script")
+
+        cmd = ["python3", str(script_path), "--falkordb-backup", falkordb_backup]
+
+        if qdrant_backup:
+            cmd.extend(["--qdrant-backup", qdrant_backup])
+        if project_id:
+            cmd.extend(["--filter-project", project_id])
+        if dry_run:
+            cmd.append("--dry-run")
+
+        if not json_mode:
+            output_info(f"Restoring from {falkordb_backup}...")
+            if dry_run:
+                output_info("(dry run mode - no changes will be made)")
+
+        # Run restore script
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+
+        if json_mode:
+            # Parse JSON output from script
+            import json
+            try:
+                # Script outputs JSON at the end between === lines
+                lines = result.stdout.strip().split('\n')
+                json_output = '\n'.join([l for l in lines if l and not l.startswith('=')])
+                restore_result = json.loads(json_output.split('\n')[-1])
+                output_json(restore_result)
+            except json.JSONDecodeError:
+                output_json({"status": "success", "output": result.stdout})
+        else:
+            output_success("Restore completed")
+            output_info(result.stdout)
+
+    except subprocess.CalledProcessError as e:
+        if json_mode:
+            output_json({"error": str(e), "stderr": e.stderr})
+        else:
+            output_error(f"Restore failed: {e.stderr}")
+        sys.exit(1)
+    except Exception as e:
+        if json_mode:
+            output_json({"error": str(e)})
+        else:
+            output_error(str(e))
+        sys.exit(1)
+
+
+@main.command()
+@click.argument("project_id")
+@click.option("--admin-token", envvar="ADMIN_API_TOKEN", help="Admin API token (or set ADMIN_API_TOKEN)")
+@click.option("--confirm", is_flag=True, help="Skip confirmation prompt")
+@click.option("--json", "json_mode", is_flag=True, help="Output JSON")
+@click.pass_context
+def clear(ctx, project_id, admin_token, confirm, json_mode):
+    """Clear all data for a project (DESTRUCTIVE)
+
+    Deletes all Memory and Pattern nodes from FalkorDB and removes
+    the project's Qdrant collection if it exists.
+
+    Requires admin token for authorization.
+
+    Example:
+        am clear old-project --admin-token $ADMIN_API_TOKEN --confirm
+    """
+    client = ctx.obj["client"]
+    if not json_mode:
+        json_mode = ctx.obj["json_mode"]
+
+    if not admin_token:
+        output_error("Admin token required. Set ADMIN_API_TOKEN or use --admin-token")
+        sys.exit(1)
+
+    # Prompt for confirmation unless --confirm flag provided
+    if not confirm and not json_mode:
+        import click as click_module
+        confirmed = click_module.confirm(
+            f"⚠️  This will DELETE ALL data for project '{project_id}'. Continue?",
+            default=False
+        )
+        if not confirmed:
+            output_info("Cancelled")
+            sys.exit(0)
+
+    try:
+        result = client.clear_project(project_id, admin_token)
+
+        if json_mode:
+            output_json(result)
+        else:
+            deleted = result.get("deleted", {})
+            output_success(f"Cleared project '{project_id}'")
+            output_info(f"Deleted {deleted.get('memories', 0)} memories")
+            output_info(f"Deleted {deleted.get('patterns', 0)} patterns")
+            if deleted.get('qdrant_collection'):
+                output_info(f"Deleted Qdrant collection")
+
+    except httpx.HTTPStatusError as e:
+        if json_mode:
+            output_json({"error": str(e), "status_code": e.response.status_code})
+        else:
+            output_error(f"HTTP {e.response.status_code}: {e.response.text}")
+        sys.exit(1)
+    except Exception as e:
+        if json_mode:
+            output_json({"error": str(e)})
+        else:
+            output_error(str(e))
+        sys.exit(1)
+
+
 if __name__ == "__main__":
     main()

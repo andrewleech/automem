@@ -2829,6 +2829,185 @@ def health() -> Any:
     return jsonify(health_data)
 
 
+@app.route("/projects", methods=["GET"])
+def list_projects() -> Any:
+    """List all project IDs with memory counts.
+
+    Returns:
+        {
+            "projects": [
+                {
+                    "id": "project-name",
+                    "memory_count": 150,
+                    "pattern_count": 2,
+                    "has_qdrant_collection": true
+                },
+                ...
+            ]
+        }
+    """
+    try:
+        graph = get_memory_graph()
+
+        # Get all distinct project_ids from Memory nodes
+        memory_result = graph.query("""
+            MATCH (m:Memory)
+            RETURN m.project_id as project_id, COUNT(m) as memory_count
+        """)
+
+        # Get pattern counts per project
+        pattern_result = graph.query("""
+            MATCH (p:Pattern)
+            RETURN p.project_id as project_id, COUNT(p) as pattern_count
+        """)
+
+        # Build project map
+        projects = {}
+
+        if memory_result.result_set:
+            for row in memory_result.result_set:
+                project_id = row[0]
+                memory_count = row[1]
+                if project_id:  # Skip null project_ids
+                    projects[project_id] = {
+                        "id": project_id,
+                        "memory_count": memory_count,
+                        "pattern_count": 0,
+                    }
+
+        if pattern_result.result_set:
+            for row in pattern_result.result_set:
+                project_id = row[0]
+                pattern_count = row[1]
+                if project_id:
+                    if project_id not in projects:
+                        projects[project_id] = {
+                            "id": project_id,
+                            "memory_count": 0,
+                            "pattern_count": pattern_count,
+                        }
+                    else:
+                        projects[project_id]["pattern_count"] = pattern_count
+
+        # Check for Qdrant collections
+        try:
+            qdrant = get_qdrant_client()
+            if qdrant:
+                collections = qdrant.get_collections()
+                collection_names = {c.name for c in collections.collections}
+
+                for project_id in projects:
+                    collection_name = f"{project_id}_memories"
+                    projects[project_id]["has_qdrant_collection"] = collection_name in collection_names
+            else:
+                for project_id in projects:
+                    projects[project_id]["has_qdrant_collection"] = False
+        except Exception as e:
+            logger.warning(f"Failed to check Qdrant collections: {e}")
+            for project_id in projects:
+                projects[project_id]["has_qdrant_collection"] = None
+
+        return jsonify({
+            "status": "success",
+            "projects": sorted(projects.values(), key=lambda p: p["id"])
+        })
+
+    except Exception as e:
+        logger.exception("Failed to list projects")
+        abort(500, description=f"Failed to list projects: {str(e)}")
+
+
+@app.route("/projects/<project_id>", methods=["DELETE"])
+def clear_project(project_id: str) -> Any:
+    """Clear all data for a specific project.
+
+    Deletes:
+    - All Memory and Pattern nodes in FalkorDB
+    - Project-specific Qdrant collection if it exists
+
+    Args:
+        project_id: Project identifier
+
+    Query params:
+        confirm: Must be "yes" to proceed (safety check)
+
+    Returns:
+        {
+            "status": "success",
+            "project_id": "...",
+            "deleted": {
+                "memories": 150,
+                "patterns": 2,
+                "qdrant_collection": true
+            }
+        }
+    """
+    # Require admin token for destructive operations
+    admin_token = _extract_admin_token()
+    if not admin_token or admin_token != ADMIN_API_TOKEN:
+        abort(403, description="Admin authentication required for project deletion")
+
+    # Require explicit confirmation
+    confirm = request.args.get("confirm")
+    if confirm != "yes":
+        abort(400, description="Must provide ?confirm=yes to delete project data")
+
+    try:
+        graph = get_memory_graph()
+
+        # Count what we're about to delete
+        memory_result = graph.query(
+            "MATCH (m:Memory) WHERE m.project_id = $project_id RETURN COUNT(m) as count",
+            {"project_id": project_id}
+        )
+        memory_count = memory_result.result_set[0][0] if memory_result.result_set else 0
+
+        pattern_result = graph.query(
+            "MATCH (p:Pattern) WHERE p.project_id = $project_id RETURN COUNT(p) as count",
+            {"project_id": project_id}
+        )
+        pattern_count = pattern_result.result_set[0][0] if pattern_result.result_set else 0
+
+        # Delete from FalkorDB (DETACH DELETE removes nodes and their relationships)
+        graph.query(
+            "MATCH (m:Memory) WHERE m.project_id = $project_id DETACH DELETE m",
+            {"project_id": project_id}
+        )
+        graph.query(
+            "MATCH (p:Pattern) WHERE p.project_id = $project_id DETACH DELETE p",
+            {"project_id": project_id}
+        )
+
+        # Delete Qdrant collection if it exists
+        qdrant_deleted = False
+        try:
+            qdrant = get_qdrant_client()
+            if qdrant:
+                collection_name = f"{project_id}_memories"
+                try:
+                    qdrant.delete_collection(collection_name)
+                    qdrant_deleted = True
+                    logger.info(f"Deleted Qdrant collection: {collection_name}")
+                except Exception as e:
+                    logger.warning(f"Failed to delete Qdrant collection {collection_name}: {e}")
+        except Exception as e:
+            logger.warning(f"Failed to connect to Qdrant for collection deletion: {e}")
+
+        return jsonify({
+            "status": "success",
+            "project_id": project_id,
+            "deleted": {
+                "memories": memory_count,
+                "patterns": pattern_count,
+                "qdrant_collection": qdrant_deleted
+            }
+        })
+
+    except Exception as e:
+        logger.exception(f"Failed to clear project {project_id}")
+        abort(500, description=f"Failed to clear project: {str(e)}")
+
+
 @app.route("/memory", methods=["POST"])
 def store_memory() -> Any:
     query_start = time.perf_counter()
