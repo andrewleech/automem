@@ -70,7 +70,7 @@ class AutoMemRestore:
     def __init__(
         self,
         falkordb_backup: Optional[Path] = None,
-        qdrant_backup: Optional[Path] = None,
+        qdrant_backups: Optional[List[Path]] = None,
         dry_run: bool = False,
         skip_falkordb: bool = False,
         skip_qdrant: bool = False,
@@ -82,7 +82,7 @@ class AutoMemRestore:
 
         Args:
             falkordb_backup: Path to FalkorDB backup file
-            qdrant_backup: Path to Qdrant backup file
+            qdrant_backups: List of paths to Qdrant backup files (one per collection)
             dry_run: Only validate, don't restore
             skip_falkordb: Skip FalkorDB restoration
             skip_qdrant: Skip Qdrant restoration
@@ -91,7 +91,7 @@ class AutoMemRestore:
             filter_project: Only restore data from specific project
         """
         self.falkordb_backup = falkordb_backup
-        self.qdrant_backup = qdrant_backup
+        self.qdrant_backups = qdrant_backups or []
         self.dry_run = dry_run
         self.skip_falkordb = skip_falkordb
         self.skip_qdrant = skip_qdrant
@@ -106,7 +106,8 @@ class AutoMemRestore:
             "nodes_skipped": 0,
             "relationships_skipped": 0,
             "points_skipped": 0,
-            "errors": []
+            "errors": [],
+            "collections_restored": 0
         }
 
     def load_and_validate_backups(self) -> Tuple[Optional[Dict], Optional[Dict]]:
@@ -619,34 +620,71 @@ class AutoMemRestore:
             "success": False,
             "dry_run": self.dry_run,
             "falkordb": None,
-            "qdrant": None,
+            "qdrant": [],
             "warnings": [],
             "errors": [],
             "duration_seconds": 0
         }
 
         try:
-            # Load and validate backups
-            falkor_data, qdrant_data = self.load_and_validate_backups()
+            # Load and validate FalkorDB backup
+            falkor_data = None
+            if self.falkordb_backup and not self.skip_falkordb:
+                logger.info(f"📖 Loading FalkorDB backup: {self.falkordb_backup.name}")
+                try:
+                    with gzip.open(self.falkordb_backup, "rt", encoding="utf-8") as f:
+                        falkor_data = json.load(f)
 
-            # Validate integrity
-            warnings = self.validate_backup_integrity(falkor_data, qdrant_data)
-            results["warnings"] = warnings
+                    required_keys = ["timestamp", "graph_name", "nodes", "relationships"]
+                    missing = [k for k in required_keys if k not in falkor_data]
+                    if missing:
+                        raise ValueError(f"Missing keys in FalkorDB backup: {missing}")
+
+                    logger.info(f"   ✓ Nodes: {len(falkor_data['nodes'])}")
+                    logger.info(f"   ✓ Relationships: {len(falkor_data['relationships'])}")
+                except Exception as e:
+                    logger.error(f"❌ Failed to load FalkorDB backup: {e}")
+                    raise
 
             # Restore FalkorDB
             if falkor_data and not self.skip_falkordb:
                 falkor_stats = self.restore_falkordb(falkor_data)
                 results["falkordb"] = falkor_stats
 
-            # Restore Qdrant
-            if qdrant_data and not self.skip_qdrant:
-                qdrant_stats = self.restore_qdrant(qdrant_data)
-                results["qdrant"] = qdrant_stats
+            # Restore Qdrant collections
+            if self.qdrant_backups and not self.skip_qdrant:
+                logger.info(f"📖 Restoring {len(self.qdrant_backups)} Qdrant collection(s)...")
+
+                for qdrant_backup in self.qdrant_backups:
+                    try:
+                        logger.info(f"   Loading {qdrant_backup.name}...")
+                        with gzip.open(qdrant_backup, "rt", encoding="utf-8") as f:
+                            qdrant_data = json.load(f)
+
+                        required_keys = ["timestamp", "collection_name", "points"]
+                        missing = [k for k in required_keys if k not in qdrant_data]
+                        if missing:
+                            raise ValueError(f"Missing keys in Qdrant backup: {missing}")
+
+                        logger.info(f"   ✓ Collection: {qdrant_data['collection_name']}, Points: {len(qdrant_data['points'])}")
+
+                        # Restore this collection
+                        qdrant_stats = self.restore_qdrant(qdrant_data)
+                        results["qdrant"].append({
+                            "collection": qdrant_data["collection_name"],
+                            "stats": qdrant_stats
+                        })
+                        self.stats["collections_restored"] += 1
+
+                    except Exception as e:
+                        logger.error(f"❌ Failed to restore {qdrant_backup.name}: {e}")
+                        self.stats["errors"].append(f"Qdrant {qdrant_backup.name}: {e}")
 
             # Report results
             duration = time.time() - start_time
             results["duration_seconds"] = round(duration, 2)
             results["errors"] = self.stats["errors"]
+            results["collections_restored"] = self.stats["collections_restored"]
 
             if self.stats["errors"]:
                 logger.warning(f"⚠️  Restore completed with {len(self.stats['errors'])} errors")
@@ -687,18 +725,65 @@ def find_latest_backup(backup_dir: Path, backup_type: str) -> Optional[Path]:
     return backups[0] if backups else None
 
 
+def find_latest_qdrant_backups(backup_dir: Path) -> List[Path]:
+    """Find all Qdrant backup files from the most recent backup run.
+
+    Args:
+        backup_dir: Root backup directory
+
+    Returns:
+        List of paths to Qdrant backup files from same timestamp
+    """
+    backup_path = backup_dir / "qdrant"
+    if not backup_path.exists():
+        return []
+
+    # Find most recent backup file
+    backups = sorted(
+        backup_path.glob("qdrant_*.json.gz"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True
+    )
+
+    if not backups:
+        return []
+
+    # Extract timestamp from most recent file
+    # Format: qdrant_{collection}_{timestamp}.json.gz or qdrant_{timestamp}.json.gz
+    latest = backups[0]
+    filename = latest.stem.replace(".json", "")  # Remove .json from .json.gz
+    parts = filename.split("_")
+
+    # Find timestamp (last part that looks like a timestamp)
+    timestamp = parts[-1] if len(parts) > 1 else None
+
+    if not timestamp:
+        return [latest]
+
+    # Find all backup files with this timestamp
+    matching = []
+    for backup_file in backup_path.glob(f"qdrant_*_{timestamp}.json.gz"):
+        matching.append(backup_file)
+
+    # Sort by collection name for consistent ordering
+    matching.sort()
+
+    logger.info(f"   Found {len(matching)} Qdrant backup file(s) from timestamp {timestamp}")
+    return matching
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="AutoMem restore tool - restores FalkorDB and Qdrant from compressed JSON backups",
         epilog="""
 Examples:
-  # Restore from specific backup files
+  # Restore from latest backups (all collections)
+  python scripts/restore_automem.py --latest
+
+  # Restore specific single collection only
   python scripts/restore_automem.py \\
     --falkordb-backup backups/falkordb/falkordb_20250104_120000.json.gz \\
-    --qdrant-backup backups/qdrant/qdrant_20250104_120000.json.gz
-
-  # Restore from latest backups
-  python scripts/restore_automem.py --latest
+    --qdrant-backup backups/qdrant/qdrant_memories_20250104_120000.json.gz
 
   # Dry run (validate only)
   python scripts/restore_automem.py --latest --dry-run
@@ -720,7 +805,7 @@ Examples:
     parser.add_argument(
         "--qdrant-backup",
         type=str,
-        help="Path to Qdrant backup file (.json.gz)"
+        help="Path to single Qdrant backup file (.json.gz) - use --latest to restore all collections"
     )
     parser.add_argument(
         "--backup-dir",
@@ -795,22 +880,23 @@ Examples:
     if args.latest:
         logger.info(f"🔍 Finding latest backups in {backup_dir}")
         falkordb_backup = find_latest_backup(backup_dir, "falkordb")
-        qdrant_backup = find_latest_backup(backup_dir, "qdrant")
+        qdrant_backups = find_latest_qdrant_backups(backup_dir)
 
         if not falkordb_backup and not args.skip_falkordb:
             logger.error("❌ No FalkorDB backup found")
             sys.exit(1)
-        if not qdrant_backup and not args.skip_qdrant:
-            logger.error("❌ No Qdrant backup found")
+        if not qdrant_backups and not args.skip_qdrant:
+            logger.error("❌ No Qdrant backups found")
             sys.exit(1)
     else:
         falkordb_backup = Path(args.falkordb_backup) if args.falkordb_backup else None
-        qdrant_backup = Path(args.qdrant_backup) if args.qdrant_backup else None
+        # Wrap single qdrant backup in list for consistency
+        qdrant_backups = [Path(args.qdrant_backup)] if args.qdrant_backup else []
 
         if not falkordb_backup and not args.skip_falkordb:
             logger.error("❌ --falkordb-backup required (or use --latest)")
             sys.exit(1)
-        if not qdrant_backup and not args.skip_qdrant:
+        if not qdrant_backups and not args.skip_qdrant:
             logger.error("❌ --qdrant-backup required (or use --latest)")
             sys.exit(1)
 
@@ -818,14 +904,15 @@ Examples:
     if falkordb_backup and not falkordb_backup.exists():
         logger.error(f"❌ FalkorDB backup not found: {falkordb_backup}")
         sys.exit(1)
-    if qdrant_backup and not qdrant_backup.exists():
-        logger.error(f"❌ Qdrant backup not found: {qdrant_backup}")
-        sys.exit(1)
+    for qdrant_backup in qdrant_backups:
+        if not qdrant_backup.exists():
+            logger.error(f"❌ Qdrant backup not found: {qdrant_backup}")
+            sys.exit(1)
 
     # Run restore
     restore = AutoMemRestore(
         falkordb_backup=falkordb_backup,
-        qdrant_backup=qdrant_backup,
+        qdrant_backups=qdrant_backups,
         dry_run=args.dry_run,
         skip_falkordb=args.skip_falkordb,
         skip_qdrant=args.skip_qdrant,

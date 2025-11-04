@@ -145,63 +145,97 @@ class AutoMemBackup:
             logger.error(f"❌ FalkorDB backup failed: {e}")
             raise
     
-    def backup_qdrant(self) -> Path:
-        """Export Qdrant collection to JSON."""
-        logger.info("🔍 Backing up Qdrant collection...")
-        
+    def backup_qdrant_collection(self, client: QdrantClient, collection_name: str) -> Path:
+        """Export a single Qdrant collection to JSON.
+
+        Args:
+            client: QdrantClient instance
+            collection_name: Name of collection to backup
+
+        Returns:
+            Path to backup file
+        """
+        logger.info(f"   Backing up collection '{collection_name}'...")
+
+        # Fetch all points
+        all_points = []
+        offset = None
+        batch_size = 100
+
+        while True:
+            result = client.scroll(
+                collection_name=collection_name,
+                limit=batch_size,
+                offset=offset,
+                with_payload=True,
+                with_vectors=True
+            )
+
+            points, next_offset = result
+
+            for point in points:
+                all_points.append({
+                    "id": point.id,
+                    "vector": point.vector,
+                    "payload": point.payload
+                })
+
+            if next_offset is None:
+                break
+            offset = next_offset
+
+        # Create backup data
+        collection_info = client.get_collection(collection_name)
+        backup_data = {
+            "timestamp": self.timestamp,
+            "collection_name": collection_name,
+            "points": all_points,
+            "stats": {
+                "points_count": len(all_points),
+                "vector_size": collection_info.config.params.vectors.size,
+            }
+        }
+
+        # Write to compressed file with collection name
+        backup_file = self.backup_dir / "qdrant" / f"qdrant_{collection_name}_{self.timestamp}.json.gz"
+        with gzip.open(backup_file, "wt", encoding="utf-8") as f:
+            json.dump(backup_data, f, indent=2, default=str)
+
+        size_mb = backup_file.stat().st_size / 1024 / 1024
+        logger.info(f"   ✓ Saved {backup_file.name} ({size_mb:.2f} MB, {len(all_points)} points)")
+
+        return backup_file
+
+    def backup_qdrant(self) -> List[Path]:
+        """Export all Qdrant collections to JSON.
+
+        Returns:
+            List of paths to backup files
+        """
+        logger.info("🔍 Backing up Qdrant collections...")
+
         try:
             client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
-            
-            # Fetch all points
-            all_points = []
-            offset = None
-            batch_size = 100
-            
-            while True:
-                result = client.scroll(
-                    collection_name=QDRANT_COLLECTION,
-                    limit=batch_size,
-                    offset=offset,
-                    with_payload=True,
-                    with_vectors=True
-                )
-                
-                points, next_offset = result
-                
-                for point in points:
-                    all_points.append({
-                        "id": point.id,
-                        "vector": point.vector,
-                        "payload": point.payload
-                    })
-                
-                if next_offset is None:
-                    break
-                offset = next_offset
-            
-            # Create backup data
-            collection_info = client.get_collection(QDRANT_COLLECTION)
-            backup_data = {
-                "timestamp": self.timestamp,
-                "collection_name": QDRANT_COLLECTION,
-                "points": all_points,
-                "stats": {
-                    "points_count": len(all_points),
-                    "vector_size": collection_info.config.params.vectors.size,
-                }
-            }
-            
-            # Write to compressed file
-            backup_file = self.backup_dir / "qdrant" / f"qdrant_{self.timestamp}.json.gz"
-            with gzip.open(backup_file, "wt", encoding="utf-8") as f:
-                json.dump(backup_data, f, indent=2, default=str)
-            
-            size_mb = backup_file.stat().st_size / 1024 / 1024
-            logger.info(f"✅ Qdrant backup saved: {backup_file.name} ({size_mb:.2f} MB)")
-            logger.info(f"   Points: {len(all_points)}")
-            
-            return backup_file
-            
+
+            # Get all collections
+            collections = client.get_collections()
+            collection_names = [c.name for c in collections.collections]
+
+            if not collection_names:
+                logger.warning("⚠️  No Qdrant collections found")
+                return []
+
+            logger.info(f"   Found {len(collection_names)} collection(s): {', '.join(collection_names)}")
+
+            # Backup each collection
+            backup_files = []
+            for collection_name in collection_names:
+                backup_file = self.backup_qdrant_collection(client, collection_name)
+                backup_files.append(backup_file)
+
+            logger.info(f"✅ Qdrant backup completed: {len(backup_files)} collection(s)")
+            return backup_files
+
         except Exception as e:
             logger.error(f"❌ Qdrant backup failed: {e}")
             raise
@@ -255,34 +289,36 @@ class AutoMemBackup:
     def run_backup(self, cleanup: bool = False, keep: int = 7) -> Dict[str, Any]:
         """Run full backup process."""
         logger.info(f"🚀 Starting AutoMem backup - {self.timestamp}")
-        
+
         results = {
             "timestamp": self.timestamp,
             "falkordb": None,
-            "qdrant": None,
+            "qdrant": [],
             "s3_uploaded": False
         }
-        
+
         try:
             # Backup FalkorDB
             falkor_backup = self.backup_falkordb()
             results["falkordb"] = str(falkor_backup)
-            
+
             if self.s3_bucket:
                 self.upload_to_s3(falkor_backup)
-            
-            # Backup Qdrant
-            qdrant_backup = self.backup_qdrant()
-            results["qdrant"] = str(qdrant_backup)
-            
+
+            # Backup Qdrant (all collections)
+            qdrant_backups = self.backup_qdrant()
+            results["qdrant"] = [str(f) for f in qdrant_backups]
+            results["qdrant_collections"] = len(qdrant_backups)
+
             if self.s3_bucket:
-                self.upload_to_s3(qdrant_backup)
+                for qdrant_backup in qdrant_backups:
+                    self.upload_to_s3(qdrant_backup)
                 results["s3_uploaded"] = True
-            
+
             # Cleanup old backups
             if cleanup:
                 self.cleanup_old_backups(keep=keep)
-            
+
             logger.info("✅ Backup completed successfully")
             return results
             
