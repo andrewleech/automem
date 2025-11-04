@@ -50,7 +50,7 @@ FALKORDB_PASSWORD = os.getenv("FALKORDB_PASSWORD")
 FALKORDB_GRAPH = os.getenv("FALKORDB_GRAPH", "memories")
 
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
-QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY") or None  # Convert empty string to None
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "memories")
 
 
