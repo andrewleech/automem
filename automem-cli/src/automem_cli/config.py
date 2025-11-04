@@ -1,8 +1,9 @@
 """Configuration management for AutoMem CLI"""
 
 import os
+import re
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import yaml
 from pydantic import BaseModel, HttpUrl, field_validator
@@ -29,6 +30,38 @@ class Config(BaseModel):
         except Exception as e:
             raise ValueError(f"Invalid endpoint URL: {e}")
         return v.rstrip("/")
+
+    @staticmethod
+    def _expand_env_vars(data: Dict[str, Any]) -> Dict[str, Any]:
+        """Expand environment variable placeholders like ${VAR_NAME} in config values
+
+        Args:
+            data: Config dictionary that may contain ${VAR_NAME} placeholders
+
+        Returns:
+            Config dictionary with placeholders expanded to actual env var values
+        """
+        expanded = {}
+        env_var_pattern = re.compile(r'\$\{([^}]+)\}')
+
+        for key, value in data.items():
+            if isinstance(value, str):
+                # Check if value is a placeholder like ${VAR_NAME}
+                match = env_var_pattern.fullmatch(value)
+                if match:
+                    # Full string is a placeholder, replace with env var value or None
+                    var_name = match.group(1)
+                    expanded[key] = os.getenv(var_name)
+                else:
+                    # String may contain embedded placeholders, expand them
+                    def replacer(m):
+                        var_name = m.group(1)
+                        return os.getenv(var_name, m.group(0))
+                    expanded[key] = env_var_pattern.sub(replacer, value)
+            else:
+                expanded[key] = value
+
+        return expanded
 
     @classmethod
     def load(cls, config_dir: Optional[Path] = None) -> "Config":
@@ -68,12 +101,13 @@ class Config(BaseModel):
             try:
                 file_data = yaml.safe_load(config_file.read_text())
                 if file_data:
-                    data = file_data
+                    # Expand environment variable placeholders like ${VAR_NAME}
+                    data = cls._expand_env_vars(file_data)
             except Exception as e:
                 # Don't fail on bad config, just use defaults
                 pass
 
-        # Override with environment variables
+        # Override with environment variables (highest priority)
         if token := os.getenv("AUTOMEM_API_TOKEN"):
             data["api_token"] = token
         if endpoint := os.getenv("AUTOMEM_ENDPOINT"):
