@@ -675,13 +675,22 @@ def test_startup_recall(client, mock_state, auth_headers):
         "timestamp": now,
         "tags": ["critical"]
     }
+    mock_state.memory_graph.memories["recent"] = {
+        "id": "recent",
+        "content": "Recent update",
+        "importance": 0.5,
+        "timestamp": now,
+        "tags": ["update"]
+    }
 
     response = client.get("/startup-recall", headers=auth_headers)
     assert response.status_code == 200
     data = response.get_json()
     assert "status" in data
-    # API returns different field structure for startup recall
-    assert "has_critical" in data or "critical_lessons" in data
+    assert "critical_lessons" in data
+    assert "recent_memories" in data
+    assert "recent_count" in data
+    assert data["recent_count"] >= 0
 
 
 # ==================== Test Analyze Endpoint ====================

@@ -345,6 +345,88 @@ def health(ctx, json_mode):
 
 
 @main.command()
+@click.option("--json", "json_mode", is_flag=True, help="Output JSON")
+@click.pass_context
+def startup(ctx, json_mode):
+    """Recall critical context for session startup
+
+    Retrieves:
+    - Critical lessons (tags: critical, lesson, ai-assistant)
+    - System rules (tags: system, memory-recall)
+    - 5 most recent memories
+
+    Example:
+        am startup --json
+    """
+    client = ctx.obj["client"]
+    # Use local json_mode parameter, fallback to global if not provided
+    if not json_mode:
+        json_mode = ctx.obj["json_mode"]
+
+    try:
+        result = client.startup_recall()
+
+        if json_mode:
+            output_json(result)
+        else:
+            # Display three sections in rich terminal format
+            critical_lessons = result.get("critical_lessons", [])
+            system_rules = result.get("system_rules", [])
+            recent_memories = result.get("recent_memories", [])
+
+            output_success(result.get("summary", "Session context loaded"))
+
+            if critical_lessons:
+                output_info(f"\n📚 Critical Lessons ({len(critical_lessons)}):")
+                output_rich("", critical_lessons)
+
+            if system_rules:
+                output_info(f"\n⚙️  System Rules ({len(system_rules)}):")
+                output_rich("", system_rules)
+
+            if recent_memories:
+                output_info(f"\n🕐 Recent Memories ({len(recent_memories)}):")
+                output_rich("", recent_memories)
+
+            if not critical_lessons and not system_rules and not recent_memories:
+                output_warning("No startup context found")
+                output_info("Store memories with tags: critical, lesson, system, or ai-assistant")
+
+    except httpx.HTTPStatusError as e:
+        if json_mode:
+            output_json({"error": str(e), "status_code": e.response.status_code})
+        else:
+            if e.response.status_code == 401:
+                output_error("Authentication failed")
+                output_info("Set AUTOMEM_API_TOKEN or run 'am init' to configure")
+            else:
+                output_error(f"HTTP {e.response.status_code}: {e.response.text}")
+        sys.exit(1)
+    except httpx.ConnectError as e:
+        if json_mode:
+            output_json({"error": "Connection refused", "endpoint": client.config.endpoint})
+        else:
+            output_error(f"Cannot connect to {client.config.endpoint}")
+            output_info("Check that the AutoMem server is running")
+        sys.exit(1)
+    except (httpx.RemoteProtocolError, ConnectionResetError) as e:
+        if json_mode:
+            output_json({"error": "Connection reset by server"})
+        else:
+            output_error("Connection rejected by server")
+            if not client.config.api_token:
+                output_warning("No API token configured")
+                output_info("Set AUTOMEM_API_TOKEN or run 'am init' to configure")
+        sys.exit(1)
+    except Exception as e:
+        if json_mode:
+            output_json({"error": str(e)})
+        else:
+            output_error(str(e))
+        sys.exit(1)
+
+
+@main.command()
 @click.option("--endpoint", prompt="API endpoint", default="http://localhost:8001")
 @click.option("--token", prompt="API token (or leave empty for env var)", default="")
 @click.option("--project", prompt="Project ID", default=lambda: Path.cwd().name)
@@ -493,7 +575,17 @@ The `am` tool searches upward from your current directory for `.automem/config.y
 
 ### Agent Workflow
 
-**Session Start (recommended):**
+**Session Start (CRITICAL - run every session):**
+```bash
+am startup --json     # Load critical lessons, system rules, and recent context
+```
+
+This returns structured context in three categories:
+- **Critical lessons**: High-importance memories tagged with `critical`, `lesson`, or `ai-assistant`
+- **System rules**: Memories tagged with `system` or `memory-recall`
+- **Recent memories**: 5 most recent memories for session continuation
+
+Alternative (manual filtering):
 ```bash
 am recall --importance-min 0.7 --json     # Load high-priority context
 ```
@@ -552,6 +644,7 @@ am recall "authentication flow" --limit 5 --json
 ### All Commands
 ```bash
 am init                                           # Initialize workspace
+am startup --json                                 # Load session context (critical/system/recent)
 am store "content" [opts] --json                 # Store memory
   Options: -t type, -p priority, --tag (repeatable), --tags (CSV), --note, --discovered-from
 am recall [query] --json                          # Recall memories

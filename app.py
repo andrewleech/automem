@@ -3591,7 +3591,7 @@ def consolidation_status() -> Any:
 
 @app.route("/startup-recall", methods=["GET"])
 def startup_recall() -> Any:
-    """Recall critical lessons at session startup."""
+    """Recall critical lessons and recent memories at session startup."""
     project_id = _extract_project_id()
     graph = get_memory_graph()
     if graph is None:
@@ -3643,13 +3643,42 @@ def startup_recall() -> Any:
                     'tags': row[2] if row[2] else []
                 })
 
+        # Get 5 most recent memories
+        recent_query = """
+            MATCH (m:Memory)
+            WHERE m.project_id = $project_id
+              AND m.timestamp IS NOT NULL
+            RETURN m.id as id, m.content as content, m.tags as tags,
+                   m.importance as importance, m.type as type, m.metadata as metadata,
+                   m.timestamp as timestamp
+            ORDER BY m.timestamp DESC
+            LIMIT 5
+        """
+
+        recent_results = graph.query(recent_query, {"project_id": project_id})
+        recent_memories = []
+
+        if recent_results.result_set:
+            for row in recent_results.result_set:
+                recent_memories.append({
+                    'id': row[0],
+                    'content': row[1],
+                    'tags': row[2] if row[2] else [],
+                    'importance': row[3] if row[3] else 0.5,
+                    'type': row[4] if row[4] else 'Context',
+                    'metadata': json.loads(row[5]) if row[5] else {},
+                    'timestamp': row[6]
+                })
+
         response = {
             'status': 'success',
             'critical_lessons': lessons,
             'system_rules': system_rules,
+            'recent_memories': recent_memories,
             'lesson_count': len(lessons),
+            'recent_count': len(recent_memories),
             'has_critical': any(l.get('importance', 0) >= 0.9 for l in lessons),
-            'summary': f"Recalled {len(lessons)} lesson(s) and {len(system_rules)} system rule(s)"
+            'summary': f"Recalled {len(lessons)} lesson(s), {len(system_rules)} system rule(s), and {len(recent_memories)} recent memory/memories"
         }
 
         return jsonify(response), 200

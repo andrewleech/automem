@@ -199,3 +199,13 @@ class AutoMemClient:
         response = self.client.get("/health")
         response.raise_for_status()
         return response.json()
+
+    def startup_recall(self) -> dict[str, Any]:
+        """Recall critical lessons and recent memories at session startup
+
+        Returns:
+            Dict with critical_lessons, system_rules, recent_memories lists
+        """
+        response = self.client.get("/startup-recall")
+        response.raise_for_status()
+        return response.json()

@@ -53,7 +53,7 @@ The API (`app.py`) provides 13 endpoints:
 ### Consolidation & Analysis
 - `POST /consolidate` - Trigger memory consolidation tasks (decay, creative, cluster, forget, full)
 - `GET /consolidate/status` - Check consolidation scheduler status and last run times
-- `GET /startup-recall` - Retrieve memories for startup context
+- `GET /startup-recall` - Retrieve critical lessons, system rules, and 5 most recent memories for session continuation
 - `GET /analyze` - Analyze graph statistics and memory patterns
 
 ### Enrichment
