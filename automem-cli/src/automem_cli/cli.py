@@ -295,6 +295,24 @@ def health(ctx, json_mode):
                 qdrant_status = "✓" if result["qdrant"] else "✗"
                 output_info(f"Qdrant: {qdrant_status}")
 
+            # Show auth configuration
+            if "auth" in result:
+                auth = result["auth"]
+                server_requires_auth = auth.get("required", False)
+                client_has_token = bool(config.api_token)
+
+                if server_requires_auth:
+                    if client_has_token:
+                        output_info(f"Auth: Server requires token, client configured ✓")
+                    else:
+                        output_warning(f"Auth: Server requires token, client NOT configured ✗")
+                        output_info("Set AUTOMEM_API_TOKEN or run 'am init' to configure")
+                else:
+                    if client_has_token:
+                        output_info(f"Auth: Server open (no token required)")
+                    else:
+                        output_info(f"Auth: No authentication configured")
+
             # Show project stats if available
             if "project" in result:
                 project = result["project"]

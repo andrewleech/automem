@@ -2783,6 +2783,10 @@ def health() -> Any:
         "status": status,
         "falkordb": "connected" if graph_available else "disconnected",
         "qdrant": "connected" if qdrant_available else "disconnected",
+        "auth": {
+            "required": bool(API_TOKEN),
+            "configured": bool(API_TOKEN),
+        },
         "enrichment": {
             "status": "running" if enrichment_thread_alive else "stopped",
             "queue_depth": state.enrichment_queue.qsize() if state.enrichment_queue else 0,
