@@ -1,5 +1,6 @@
 """Main CLI interface for AutoMem"""
 
+import json
 import sys
 from pathlib import Path
 from typing import Optional
@@ -1015,6 +1016,224 @@ def restore(ctx, falkordb_backup, qdrant_backup, project_id, dry_run, json_mode)
         else:
             output_error(str(e))
         sys.exit(1)
+
+
+def _get_claude_settings_path(use_global: bool) -> Path:
+    """Get path to Claude Code settings file.
+
+    Args:
+        use_global: If True, use global settings (~/.claude/settings.json)
+                   If False, use project-local (.claude/settings.local.json)
+
+    Returns:
+        Path to settings file
+    """
+    if use_global:
+        return Path.home() / ".claude" / "settings.json"
+    else:
+        return Path.cwd() / ".claude" / "settings.local.json"
+
+
+def _get_automem_hooks_config() -> dict:
+    """Generate AutoMem hooks configuration.
+
+    Returns:
+        Dict with hooks configuration for Claude Code
+    """
+    return {
+        "SessionStart": [
+            {
+                "matcher": "*",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "echo '💡 AutoMem: Run `am startup --json` to load memories for this session'",
+                        "_automem": True  # Marker for uninstall
+                    }
+                ]
+            }
+        ],
+        "Stop": [
+            {
+                "matcher": "*",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "echo '💾 AutoMem: Remember to store learnings with `am store \"<your insight>\"` if you learned something valuable'",
+                        "_automem": True
+                    }
+                ]
+            }
+        ],
+        "PreCompact": [
+            {
+                "matcher": "*",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "echo '💾 AutoMem: Before compacting, consider storing important insights with `am store \"<insight>\"` -t insight -p 0.8'",
+                        "_automem": True
+                    }
+                ]
+            }
+        ]
+    }
+
+
+def _merge_hooks_config(existing_config: dict, automem_hooks: dict) -> dict:
+    """Merge AutoMem hooks into existing configuration.
+
+    Args:
+        existing_config: Existing settings.json config
+        automem_hooks: AutoMem hooks to add
+
+    Returns:
+        Merged configuration
+    """
+    config = existing_config.copy()
+
+    if "hooks" not in config:
+        config["hooks"] = {}
+
+    for event_name, event_hooks in automem_hooks.items():
+        if event_name not in config["hooks"]:
+            # No existing hooks for this event, just add ours
+            config["hooks"][event_name] = event_hooks
+        else:
+            # Merge with existing hooks
+            # Remove any existing AutoMem hooks first (in case of re-install)
+            existing_matchers = config["hooks"][event_name]
+            cleaned = []
+            for matcher_config in existing_matchers:
+                # Keep only non-AutoMem hooks
+                non_automem_hooks = [
+                    h for h in matcher_config.get("hooks", [])
+                    if not h.get("_automem", False)
+                ]
+                if non_automem_hooks:
+                    matcher_config["hooks"] = non_automem_hooks
+                    cleaned.append(matcher_config)
+
+            # Add AutoMem hooks
+            config["hooks"][event_name] = cleaned + event_hooks
+
+    return config
+
+
+def _remove_automem_hooks(config: dict) -> dict:
+    """Remove AutoMem hooks from configuration.
+
+    Args:
+        config: Settings configuration
+
+    Returns:
+        Configuration with AutoMem hooks removed
+    """
+    if "hooks" not in config:
+        return config
+
+    cleaned_config = config.copy()
+    cleaned_hooks = {}
+
+    for event_name, matchers in config["hooks"].items():
+        cleaned_matchers = []
+        for matcher_config in matchers:
+            # Keep only non-AutoMem hooks
+            non_automem_hooks = [
+                h for h in matcher_config.get("hooks", [])
+                if not h.get("_automem", False)
+            ]
+            if non_automem_hooks:
+                matcher_config = matcher_config.copy()
+                matcher_config["hooks"] = non_automem_hooks
+                cleaned_matchers.append(matcher_config)
+
+        if cleaned_matchers:
+            cleaned_hooks[event_name] = cleaned_matchers
+
+    cleaned_config["hooks"] = cleaned_hooks
+    return cleaned_config
+
+
+@main.command(name="install-hooks")
+@click.option("--global", "use_global", is_flag=True, help="Install globally (~/.claude/settings.json)")
+@click.option("--uninstall", is_flag=True, help="Remove AutoMem hooks")
+@click.pass_context
+def install_hooks(ctx, use_global, uninstall):
+    """Install Claude Code hooks for AutoMem integration
+
+    Installs hooks that prompt you to use AutoMem at key moments:
+    - SessionStart: Reminder to load memories with 'am startup --json'
+    - Stop: Prompt to store learnings after Claude finishes
+    - PreCompact: Reminder to save insights before context compaction
+
+    By default, installs to .claude/settings.local.json (project-specific, git-ignored).
+    Use --global to install to ~/.claude/settings.json (applies to all projects).
+
+    Examples:
+        am install-hooks              # Install to project
+        am install-hooks --global     # Install globally
+        am install-hooks --uninstall  # Remove hooks
+    """
+    settings_path = _get_claude_settings_path(use_global)
+
+    if uninstall:
+        # Remove AutoMem hooks
+        if not settings_path.exists():
+            output_info(f"No settings file found at {settings_path}")
+            return
+
+        try:
+            with open(settings_path, "r") as f:
+                config = json.load(f)
+
+            cleaned_config = _remove_automem_hooks(config)
+
+            with open(settings_path, "w") as f:
+                json.dump(cleaned_config, f, indent=2)
+
+            output_success(f"Removed AutoMem hooks from {settings_path}")
+
+        except Exception as e:
+            output_error(f"Failed to remove hooks: {e}")
+            sys.exit(1)
+
+    else:
+        # Install AutoMem hooks
+        automem_hooks = _get_automem_hooks_config()
+
+        # Load existing config or create new
+        if settings_path.exists():
+            try:
+                with open(settings_path, "r") as f:
+                    existing_config = json.load(f)
+            except json.JSONDecodeError:
+                output_warning(f"Invalid JSON in {settings_path}, creating backup")
+                settings_path.rename(settings_path.with_suffix(".json.bak"))
+                existing_config = {}
+        else:
+            existing_config = {}
+            # Create .claude directory if needed
+            settings_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Merge configurations
+        merged_config = _merge_hooks_config(existing_config, automem_hooks)
+
+        # Write updated config
+        try:
+            with open(settings_path, "w") as f:
+                json.dump(merged_config, f, indent=2)
+
+            output_success(f"Installed AutoMem hooks to {settings_path}")
+            output_info("\nInstalled hooks:")
+            output_info("  • SessionStart: Prompts to load memories with 'am startup --json'")
+            output_info("  • Stop: Reminds to store learnings after responses")
+            output_info("  • PreCompact: Prompts to save insights before compaction")
+            output_info("\nRestart Claude Code for hooks to take effect")
+
+        except Exception as e:
+            output_error(f"Failed to write settings: {e}")
+            sys.exit(1)
 
 
 @main.command()
