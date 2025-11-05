@@ -184,10 +184,15 @@ def store(ctx, json_mode, content, memory_type, priority, tags_list, tags_csv, n
 @click.option("--importance-min", type=float, help="Minimum importance filter")
 @click.option("--importance-max", type=float, help="Maximum importance filter")
 @click.option("--tag", "tags", multiple=True, help="Filter by tags")
+@click.option("--tag-mode", type=click.Choice(["any", "all"]), help="Match 'any' or 'all' tags (default: any)")
+@click.option("--tag-match", type=click.Choice(["prefix", "exact"]), help="Tag matching strategy: 'prefix' or 'exact' (default: prefix)")
 @click.option("-t", "--type", "memory_type", help="Filter by type")
+@click.option("--time-query", help="Natural language time phrase (e.g., 'today', 'last week', 'last 7 days')")
+@click.option("--start", help="ISO timestamp lower bound (e.g., 2025-09-01T00:00:00Z)")
+@click.option("--end", help="ISO timestamp upper bound (e.g., 2025-09-30T23:59:59Z)")
 @click.option("--json", "json_mode", is_flag=True, help="Output JSON")
 @click.pass_context
-def recall(ctx, json_mode, query, limit, importance_min, importance_max, tags, memory_type):
+def recall(ctx, json_mode, query, limit, importance_min, importance_max, tags, tag_mode, tag_match, memory_type, time_query, start, end):
     """Recall memories
 
     Examples:
@@ -196,6 +201,14 @@ def recall(ctx, json_mode, query, limit, importance_min, importance_max, tags, m
         am recall --importance-min 0.8 --limit 5
 
         am recall --tag api --type decision
+
+        am recall --tag deployment --tag success --tag-mode all
+
+        am recall --tag slack --tag-match exact
+
+        am recall "database" --time-query "last week"
+
+        am recall "bug fix" --start 2025-11-01T00:00:00Z --end 2025-11-05T23:59:59Z
 
         am recall "user preferences" --json | jq '.[].content'
 
@@ -214,6 +227,11 @@ def recall(ctx, json_mode, query, limit, importance_min, importance_max, tags, m
             importance_max=importance_max,
             tags=list(tags) if tags else None,
             memory_type=memory_type,
+            time_query=time_query,
+            start=start,
+            end=end,
+            tag_mode=tag_mode,
+            tag_match=tag_match,
         )
 
         memories = result.get("results", [])

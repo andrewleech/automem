@@ -79,16 +79,26 @@ class AutoMemClient:
         importance_max: Optional[float] = None,
         tags: Optional[list[str]] = None,
         memory_type: Optional[str] = None,
+        time_query: Optional[str] = None,
+        start: Optional[str] = None,
+        end: Optional[str] = None,
+        tag_mode: Optional[str] = None,
+        tag_match: Optional[str] = None,
     ) -> dict[str, Any]:
         """Recall memories
 
         Args:
-            query: Search query
+            query: Search query (text-based, performs semantic search)
             limit: Maximum results to return
             importance_min: Minimum importance filter
             importance_max: Maximum importance filter
             tags: Filter by tags
             memory_type: Filter by type
+            time_query: Natural language time phrase (e.g., 'today', 'last week')
+            start: ISO timestamp lower bound (e.g., '2025-09-01T00:00:00Z')
+            end: ISO timestamp upper bound (e.g., '2025-09-30T23:59:59Z')
+            tag_mode: 'any' (default) or 'all' - how to match multiple tags
+            tag_match: 'prefix' (default) or 'exact' - tag matching strategy
 
         Returns:
             Dict with 'results' list and metadata
@@ -105,6 +115,16 @@ class AutoMemClient:
             params["tags"] = ",".join(tags)
         if memory_type:
             params["type"] = memory_type
+        if time_query:
+            params["time_query"] = time_query
+        if start:
+            params["start"] = start
+        if end:
+            params["end"] = end
+        if tag_mode:
+            params["tag_mode"] = tag_mode
+        if tag_match:
+            params["tag_match"] = tag_match
 
         # Add X-Max-Results header if limit > 50 to override API default
         headers = {}
