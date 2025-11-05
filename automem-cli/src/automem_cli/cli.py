@@ -604,6 +604,8 @@ This returns structured context in three categories:
 - **System rules**: Memories tagged with `system` or `memory-recall`
 - **Recent memories**: 5 most recent memories for session continuation
 
+**Note**: If you need additional context beyond the startup recall, use `am recall` with specific queries or filters at any time during the session.
+
 Alternative (manual filtering):
 ```bash
 am recall --importance-min 0.7 --json     # Load high-priority context
