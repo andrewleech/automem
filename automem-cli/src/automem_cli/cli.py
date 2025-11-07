@@ -11,6 +11,7 @@ import httpx
 from . import __version__
 from .api import AutoMemClient
 from .config import Config
+from .git_context import capture_git_context
 from .output import (
     output_error,
     output_info,
@@ -103,6 +104,11 @@ def store(ctx, json_mode, content, memory_type, priority, tags_list, tags_csv, n
         metadata["discovered_from"] = discovered_from
     if note:
         metadata["note"] = note
+
+    # Capture git context (automatic, silent if unavailable)
+    git_context = capture_git_context()
+    if git_context:
+        metadata["git"] = git_context
 
     try:
         # Store the memory

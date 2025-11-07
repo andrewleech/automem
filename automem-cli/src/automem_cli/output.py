@@ -25,6 +25,66 @@ def output_json(data: Any) -> None:
         sys.exit(1)
 
 
+def _extract_metadata(item: Any) -> Any:
+    """Extract metadata from a memory item (handles nested structure)
+
+    Args:
+        item: Memory item (can be direct or nested under 'memory' key)
+
+    Returns:
+        Metadata dict or None
+    """
+    # Handle nested structure from recall API (has 'memory' key)
+    if isinstance(item, dict) and "memory" in item:
+        memory = item["memory"]
+        if isinstance(memory, dict):
+            return memory.get("metadata")
+
+    # Handle flat structure (direct metadata field)
+    if isinstance(item, dict):
+        return item.get("metadata")
+
+    return None
+
+
+def _format_git_context(metadata: Any) -> str:
+    """Format git context from metadata for display
+
+    Args:
+        metadata: Memory metadata (dict or None)
+
+    Returns:
+        Formatted git context string or empty string
+    """
+    if not metadata or not isinstance(metadata, dict):
+        return ""
+
+    git = metadata.get("git")
+    if not git or not isinstance(git, dict):
+        return ""
+
+    branch = git.get("branch", "unknown")
+    describe = git.get("describe", "")
+    status = git.get("status", "clean")
+    modified = git.get("modified_files", [])
+
+    # Format: branch@commit (dirty: file1, file2) or (clean)
+    parts = [branch]
+
+    # Add describe/commit info if available
+    if describe:
+        # Extract short commit from describe (e.g., "v1.0.0-5-gabc1234-dirty" -> "abc1234")
+        parts.append(f"@{describe}")
+
+    if status == "dirty" and modified:
+        files_str = ", ".join(modified[:3])  # Show first 3 files
+        if len(modified) > 3:
+            files_str += f", +{len(modified)-3} more"
+        return f"{' '.join(parts)} ({files_str})"
+    else:
+        return f"{' '.join(parts)} ({status})"
+
+
 def output_rich(message: str, data: Any = None) -> None:
     """Output rich formatted data to terminal
 
@@ -57,9 +117,23 @@ def output_rich(message: str, data: Any = None) -> None:
 
         # Check if items are dicts with similar keys
         if all(isinstance(item, dict) for item in data):
-            # Display as table
-            keys = set()
+            # For recall API results, extract the memory object if present
+            display_items = []
             for item in data:
+                if "memory" in item:
+                    # Recall API result with nested memory object
+                    memory = item["memory"]
+                    # Add recall metadata to display
+                    display_item = dict(memory)
+                    display_item["score"] = item.get("final_score", item.get("match_score"))
+                    display_items.append(display_item)
+                else:
+                    # Direct memory object
+                    display_items.append(item)
+
+            # Display as table with git context
+            keys = set()
+            for item in display_items:
                 keys.update(item.keys())
 
             table = Table(show_header=True)
@@ -68,11 +142,18 @@ def output_rich(message: str, data: Any = None) -> None:
                     table.add_column(key.capitalize())
                     keys.discard(key)
 
-            # Add remaining columns
-            for key in sorted(keys):
-                table.add_column(key.capitalize())
+            # Add git column if any memory has git context
+            has_git = any(_format_git_context(_extract_metadata(item)) for item in display_items)
+            if has_git:
+                table.add_column("Git Context")
 
-            for item in data:
+            # Add remaining columns (excluding metadata-related fields for cleaner display)
+            excluded_keys = {"metadata", "last_accessed", "updated_at", "tag_prefixes", "enrichment", "entities"}
+            for key in sorted(keys - excluded_keys):
+                if key not in {"id", "content", "importance", "score"}:
+                    table.add_column(key.capitalize())
+
+            for item in display_items:
                 row = []
                 for key in ["id", "content", "importance", "score"]:
                     if key in item:
@@ -81,7 +162,14 @@ def output_rich(message: str, data: Any = None) -> None:
                             value = str(value)[:47] + "..."
                         row.append(str(value))
 
-                for key in sorted(keys):
+                # Add git context if present
+                if has_git:
+                    metadata = _extract_metadata(item)
+                    git_str = _format_git_context(metadata)
+                    row.append(git_str)
+
+                # Add remaining columns
+                for key in sorted((keys - excluded_keys) - {"id", "content", "importance", "score"}):
                     row.append(str(item.get(key, "")))
 
                 table.add_row(*row)
