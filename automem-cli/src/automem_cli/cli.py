@@ -25,6 +25,133 @@ from .output import (
 CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"]}
 
 
+def _format_memories_for_context(result: dict) -> str:
+    """Format recalled memories as readable context for injection.
+
+    Args:
+        result: Startup recall API response
+
+    Returns:
+        Formatted string ready for context injection
+    """
+    lines = []
+
+    critical_lessons = result.get("critical_lessons", [])
+    system_rules = result.get("system_rules", [])
+    recent_memories = result.get("recent_memories", [])
+
+    if critical_lessons or system_rules or recent_memories:
+        lines.append("# AutoMem: Recalled Context")
+        lines.append("")
+
+    if critical_lessons:
+        lines.append("## Critical Lessons")
+        for mem in critical_lessons:
+            content = mem.get("content", "")
+            importance = mem.get("importance", 0)
+            tags = mem.get("tags", [])
+            lines.append(f"- [{importance:.1f}] {content}")
+            if tags:
+                lines.append(f"  Tags: {', '.join(tags)}")
+        lines.append("")
+
+    if system_rules:
+        lines.append("## System Rules")
+        for mem in system_rules:
+            content = mem.get("content", "")
+            lines.append(f"- {content}")
+        lines.append("")
+
+    if recent_memories:
+        lines.append("## Recent Memories")
+        for mem in recent_memories:
+            content = mem.get("content", "")
+            memory_type = mem.get("type", "")
+            timestamp = mem.get("created_at", "")
+            lines.append(f"- [{memory_type}] {content}")
+            if timestamp:
+                lines.append(f"  {timestamp}")
+        lines.append("")
+
+    if not lines:
+        lines.append("# AutoMem: No recalled memories")
+        lines.append("")
+
+    return "\n".join(lines)
+
+# Onboarding content for agents (used by both `am startup` and `am onboard`)
+AUTOMEM_GUIDE = """
+## Memory Management with AutoMem
+
+Use `am` CLI for ALL memory/context tracking. DO NOT use markdown notes, comments, or TODO lists for persistent context.
+
+### Session Start (CRITICAL - run every session)
+
+```bash
+am startup --json  # Returns critical lessons, system rules, and 5 most recent memories
+```
+
+For additional context beyond startup, use `am recall` with specific queries or filters.
+
+### During Work
+
+Store insights immediately when discovered:
+
+```bash
+# Store with type, importance, tags
+am store "Root cause: auth token expires too fast" -t insight -p 0.9 --tag authentication --json
+
+# Link discoveries (track thought chains)
+am store "Fix: increase token TTL to 30min" -t decision -p 0.9 \\
+    --tag security --tags bugfix,authentication \\
+    --discovered-from <memory-id> --json
+
+# Recall when needed
+am recall "authentication flow" --limit 5 --json
+```
+
+### Memory Classification
+
+| Type       | Importance | Use Case                              |
+|------------|------------|---------------------------------------|
+| decision   | 0.8-1.0    | Strategic choices, architectural calls|
+| insight    | 0.7-0.9    | Discoveries, key learnings            |
+| pattern    | 0.6-0.8    | Recurring behaviors, approaches       |
+| context    | 0.4-0.6    | Environmental state, project info     |
+| preference | 0.5-0.7    | User settings, style preferences      |
+| habit      | 0.5-0.7    | Regular workflows, practices          |
+
+**Importance scale**:
+- **0.9-1.0**: Critical (architectural decisions)
+- **0.7-0.9**: High (important patterns)
+- **0.5-0.7**: Medium (useful context)
+- **0.3-0.5**: Low (might forget)
+- **0.0-0.3**: Very low (archive candidate)
+
+### Key Flags
+
+- `-t, --type`: Memory type (decision, insight, pattern, context, preference, habit)
+- `-p, --priority`: Importance 0.0-1.0
+- `--tag`: Repeatable tags (`--tag foo --tag bar`)
+- `--tags`: Comma-separated tags (`--tags foo,bar,baz`)
+- `--discovered-from`: Link to source memory ID (enables relationship tracking)
+- `--note`: Additional annotation (stored in metadata)
+- `--json`: Programmatic output (use for agent operations)
+
+### Critical Behaviors
+
+- Run `am startup --json` at every session start
+- Store insights immediately upon discovery
+- Use `--discovered-from` to track discovery chains
+- Always use `--json` flag for agent operations
+- Set appropriate importance levels to guide consolidation
+
+### Project Setup
+
+The `am` tool searches upward for `.automem/config.yml` (like git searches for `.git/`). Run `am init` once per project if not found. For full command reference, run `am --help`.
+"""
+
+
 @click.group(context_settings=CONTEXT_SETTINGS)
 @click.option("--json", "json_mode", is_flag=True, help="Output JSON")
 @click.option("--endpoint", envvar="AUTOMEM_ENDPOINT", help="API endpoint")
@@ -389,17 +516,20 @@ def health(ctx, json_mode):
 
 @main.command()
 @click.option("--json", "json_mode", is_flag=True, help="Output JSON")
+@click.option("--hook", is_flag=True, help="Output in hook format (for SessionStart hooks)")
 @click.pass_context
-def startup(ctx, json_mode):
+def startup(ctx, json_mode, hook):
     """Recall critical context for session startup
 
     Retrieves:
     - Critical lessons (tags: critical, lesson, ai-assistant)
     - System rules (tags: system, memory-recall)
     - 5 most recent memories
+    - Usage guide for AutoMem integration
 
     Example:
         am startup --json
+        am startup --hook  # For use in SessionStart hooks
     """
     client = ctx.obj["client"]
     # Use local json_mode parameter, fallback to global if not provided
@@ -409,8 +539,25 @@ def startup(ctx, json_mode):
     try:
         result = client.startup_recall()
 
-        if json_mode:
-            output_json(result)
+        if hook:
+            # Format for Claude Code SessionStart hook
+            memories_context = _format_memories_for_context(result)
+            combined_context = memories_context + "\n\n" + AUTOMEM_GUIDE.strip()
+
+            hook_output = {
+                "hookSpecificOutput": {
+                    "hookEventName": "SessionStart",
+                    "additionalContext": combined_context
+                }
+            }
+            output_json(hook_output)
+        elif json_mode:
+            # Combine memories and guide in JSON output
+            combined_result = {
+                "memories": result,
+                "guide": AUTOMEM_GUIDE.strip()
+            }
+            output_json(combined_result)
         else:
             # Display three sections in rich terminal format
             critical_lessons = result.get("critical_lessons", [])
@@ -434,6 +581,12 @@ def startup(ctx, json_mode):
             if not critical_lessons and not system_rules and not recent_memories:
                 output_warning("No startup context found")
                 output_info("Store memories with tags: critical, lesson, system, or ai-assistant")
+
+            # Display usage guide
+            output_info("\n" + "="*80)
+            output_info("📖 AutoMem Usage Guide")
+            output_info("="*80)
+            click.echo(AUTOMEM_GUIDE.strip())
 
     except httpx.HTTPStatusError as e:
         if json_mode:
@@ -510,7 +663,10 @@ def init(endpoint, token, project):
                 qdrant_status = "✓" if result["qdrant"] else "✗"
                 output_info(f"Qdrant: {qdrant_status}")
 
-            output_info("Next: Ask your AI agent to run 'am onboard' and follow the integration guidance")
+            output_info("\nNext steps:")
+            output_info("  1. Run 'am install-hooks' to enable automatic memory loading in Claude Code")
+            output_info("  2. Or run 'am onboard' to generate CLAUDE.md integration instructions")
+            output_info("     (only needed if hooks aren't suitable for your workflow)")
 
         except httpx.HTTPStatusError as e:
             output_warning(f"Health check failed: HTTP {e.response.status_code}")
@@ -589,125 +745,8 @@ def onboard(no_prompt):
         am onboard >> CLAUDE.md
         am onboard --no-prompt  # Display only, no interactive prompt
     """
-    # The actual content that goes into CLAUDE.md (without setup banner)
-    claude_content = """
-## Memory Management with AutoMem
-
-**IMPORTANT**: Use **AutoMem CLI (`am`)** for ALL memory/context tracking.
-Do NOT use markdown notes, comments, or TODO lists for persistent context.
-
-### Why AutoMem?
-- Semantic search: Find memories by meaning, not keywords
-- Project isolation: Separate memory spaces per project
-- Relationship tracking: Link related insights/discoveries
-- Auto-consolidation: Decay old memories, strengthen patterns
-- Session continuity: Restore context between work sessions
-
-### Installation (if `am` tool unavailable)
-```bash
-uv tool install automem-cli
-```
-
-### Project Init (if `.automem/config.yml` not found)
-```bash
-# Run from project root (or any subdirectory)
-am init --project my-project --endpoint http://localhost:8001 --token $AUTOMEM_API_TOKEN
-```
-
-The `am` tool searches upward from your current directory for `.automem/config.yml` (like git searches for `.git/`). If not found, it falls back to environment variables and defaults. Run `am init` once per project to create the config file.
-
-### Agent Workflow
-
-**Session Start (CRITICAL - run every session):**
-```bash
-am startup --json     # Load critical lessons, system rules, and recent context
-```
-
-This returns structured context in three categories:
-- **Critical lessons**: High-importance memories tagged with `critical`, `lesson`, or `ai-assistant`
-- **System rules**: Memories tagged with `system` or `memory-recall`
-- **Recent memories**: 5 most recent memories for session continuation
-
-**Note**: If you need additional context beyond the startup recall, use `am recall` with specific queries or filters at any time during the session.
-
-Alternative (manual filtering):
-```bash
-am recall --importance-min 0.7 --json     # Load high-priority context
-```
-
-**During Work (spontaneous):**
-```bash
-# Store insights as you discover them
-am store "Root cause: auth token expires too fast" -t insight -p 0.9 --json
-
-# Link to what you were working on (with multiple tags)
-am store "Fix: increase token TTL to 30min" -t decision -p 0.9 \\
-    --tag authentication --tag security --tag bugfix \\
-    --discovered-from <memory-id> --json
-
-# Alternative: comma-separated tags
-am store "Deploy to prod Friday 2pm" -t context -p 0.7 \\
-    --tags deploy,production,scheduling --json
-
-# Add contextual notes
-am store "Bug fix for race condition" -t insight -p 0.9 \\
-    --note "Affects user login flow during peak hours" --json
-
-# Recall context when needed
-am recall "authentication flow" --limit 5 --json
-```
-
-### Memory Types (case-insensitive)
-- `decision`: Strategic choices and rationales (importance: 0.8-1.0)
-- `insight`: Learned insights and discoveries (importance: 0.7-0.9)
-- `pattern`: Recurring behaviors and approaches (importance: 0.6-0.8)
-- `context`: Environmental and project context (importance: 0.4-0.6)
-- `preference`: User preferences and settings (importance: 0.5-0.7)
-- `style`: Coding/writing style patterns (importance: 0.5-0.7)
-- `habit`: Regular practices and workflows (importance: 0.5-0.7)
-
-### Importance Levels
-- **0.9-1.0**: Critical (architectural decisions, major insights)
-- **0.7-0.9**: High (important patterns, key learnings)
-- **0.5-0.7**: Medium (useful context, preferences)
-- **0.3-0.5**: Low (minor notes, might forget)
-- **0.0-0.3**: Very low (archive candidate)
-
-### Anti-Patterns (DO NOT)
-- ❌ Markdown TODO lists for persistent context
-- ❌ Code comments for architectural decisions
-- ❌ Scattered notes across multiple files
-- ❌ Forgetting to track discovery trails
-
-### Best Practices (DO)
-- ✅ Store insights immediately when discovered
-- ✅ Use `--discovered-from` to track thought chains
-- ✅ Use `--json` flag for programmatic use
-- ✅ Set appropriate importance levels
-- ✅ Add tags for categorization
-
-### All Commands
-```bash
-am init                                           # Initialize workspace
-am startup --json                                 # Load session context (critical/system/recent)
-am store "content" [opts] --json                 # Store memory
-  Options: -t type, -p priority, --tag (repeatable), --tags (CSV), --note, --discovered-from
-am recall [query] --json                          # Recall memories
-am health                                         # Check API connectivity
-am consolidate                                    # Trigger consolidation
-am onboard                                        # Generate this guide
-am --help                                         # Full help
-```
-
-### Configuration
-
-Environment variables (highest priority):
-- `AUTOMEM_ENDPOINT` - API endpoint
-- `AUTOMEM_API_TOKEN` - Authentication token
-- `AUTOMEM_PROJECT_ID` - Project identifier
-
-Or use `.automem/config.yml` in project root (created by `am init`).
-"""
+    # Use the shared guide content
+    claude_content = AUTOMEM_GUIDE
 
     # Setup banner to display before the main content
     setup_banner = """================================================================================
@@ -1073,7 +1112,7 @@ def _get_automem_hooks_config() -> dict:
                 "hooks": [
                     {
                         "type": "command",
-                        "command": "echo '💡 AutoMem: Run `am startup --json` to load memories for this session'",
+                        "command": "am startup --hook 2>/dev/null || echo '{\"hookSpecificOutput\": {\"hookEventName\": \"SessionStart\", \"additionalContext\": \"⚠️  AutoMem not configured. Run: am init\"}}'",
                         "_automem": True  # Marker for uninstall
                     }
                 ]
@@ -1084,8 +1123,8 @@ def _get_automem_hooks_config() -> dict:
                 "matcher": "*",
                 "hooks": [
                     {
-                        "type": "command",
-                        "command": "echo '💾 AutoMem: Remember to store learnings with `am store \"<your insight>\"` if you learned something valuable'",
+                        "type": "prompt",
+                        "prompt": "Before stopping, review the conversation for important insights, decisions, or learnings that should be stored in AutoMem. If you discovered anything valuable (bugs fixed, architectural decisions, user preferences, patterns learned), use `am store` to capture them now with appropriate type (-t) and importance (-p). Only approve stopping if critical learnings are stored or there's nothing significant to remember.",
                         "_automem": True
                     }
                 ]
@@ -1096,8 +1135,8 @@ def _get_automem_hooks_config() -> dict:
                 "matcher": "*",
                 "hooks": [
                     {
-                        "type": "command",
-                        "command": "echo '💾 AutoMem: Before compacting, consider storing important insights with `am store \"<insight>\"` -t insight -p 0.8'",
+                        "type": "prompt",
+                        "prompt": "Context is about to be compacted. Review the current conversation for important insights or decisions that should be stored in AutoMem before they're lost. Use `am store` for any critical information worth remembering long-term. Consider: architectural decisions, bug fixes, user preferences, discovered patterns. Approve compaction once key learnings are stored.",
                         "_automem": True
                     }
                 ]
@@ -1188,10 +1227,10 @@ def _remove_automem_hooks(config: dict) -> dict:
 def install_hooks(ctx, use_global, uninstall):
     """Install Claude Code hooks for AutoMem integration
 
-    Installs hooks that prompt you to use AutoMem at key moments:
-    - SessionStart: Reminder to load memories with 'am startup --json'
-    - Stop: Prompt to store learnings after Claude finishes
-    - PreCompact: Reminder to save insights before context compaction
+    Installs hooks that automatically manage memory storage:
+    - SessionStart: Loads recalled memories and usage guide into context
+    - Stop: Prompts Claude to store important learnings before stopping
+    - PreCompact: Prompts Claude to store insights before context compaction
 
     By default, installs to .claude/settings.local.json (project-specific, git-ignored).
     Use --global to install to ~/.claude/settings.json (applies to all projects).
@@ -1252,9 +1291,9 @@ def install_hooks(ctx, use_global, uninstall):
 
             output_success(f"Installed AutoMem hooks to {settings_path}")
             output_info("\nInstalled hooks:")
-            output_info("  • SessionStart: Prompts to load memories with 'am startup --json'")
-            output_info("  • Stop: Reminds to store learnings after responses")
-            output_info("  • PreCompact: Prompts to save insights before compaction")
+            output_info("  • SessionStart: Loads recalled memories + usage guide into context")
+            output_info("  • Stop: Prompts Claude to store learnings before stopping")
+            output_info("  • PreCompact: Prompts Claude to store insights before compaction")
             output_info("\nRestart Claude Code for hooks to take effect")
 
         except Exception as e:

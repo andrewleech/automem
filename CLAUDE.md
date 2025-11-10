@@ -10,6 +10,43 @@ AutoMem is a Flask-based memory service that provides durable memory storage for
 
 ## Development Commands
 
+### CLI Tool (`am`)
+
+The primary interface for AutoMem is the CLI tool:
+
+```bash
+# Installation
+uv tool install automem-cli
+
+# Workspace setup
+am init                                           # Create .automem/config.yml
+am onboard                                        # Generate agent integration docs
+
+# Memory operations
+am store "content" -t type -p 0.9 --json         # Store memory
+am recall "query" --json                          # Recall memories
+am startup --json                                 # Load critical context for session
+am relate <id1> <id2> -t REINFORCES --json       # Create relationship
+am consolidate --mode decay --json                # Trigger consolidation
+
+# Project management
+am projects --json                                # List all projects
+am clear <project-id> --admin-token <token>      # Clear project data
+am backup [project-id]                           # Backup project
+am restore <backup-file>                         # Restore from backup
+
+# Integration
+am install-hooks                                  # Install Claude Code hooks
+am health --json                                  # Check API connectivity
+
+# Configuration (via environment or .automem/config.yml)
+export AUTOMEM_ENDPOINT="http://localhost:8001"
+export AUTOMEM_API_TOKEN="your-token"
+export AUTOMEM_PROJECT_ID="project-name"
+```
+
+### Development & Testing
+
 ```bash
 # Setup environment
 make install          # Create venv and install dependencies
@@ -17,7 +54,9 @@ source venv/bin/activate
 
 # Development
 make dev             # Start full stack (FalkorDB + Qdrant + API) via Docker
-make test            # Run pytest test suite
+make test            # Run unit tests only
+make test-integration # Run all tests including integration
+make test-live       # Run tests against live Railway server
 make logs            # Follow Flask API logs
 make clean           # Clean up Docker containers/volumes
 
@@ -26,10 +65,14 @@ black .              # Format Python code
 flake8               # Lint Python code
 
 # Testing specific features
-pytest                               # Run all tests
-pytest tests/test_app.py -v         # Run with verbose output
-pytest -k test_store_memory          # Run specific test by name
+pytest                                           # Run all tests
+pytest tests/test_app.py -v                     # Run with verbose output
+pytest -k test_store_memory                      # Run specific test by name
 pytest tests/test_consolidation_engine.py::TestMemoryConsolidator  # Run test class
+
+# Benchmarks
+make test-locomo      # Run LoCoMo benchmark (local)
+make test-locomo-live # Run LoCoMo benchmark (Railway)
 
 # Deployment
 make deploy          # Deploy to Railway
@@ -235,6 +278,24 @@ python scripts/migrate_mcp_sqlite.py \
 python scripts/reembed_embeddings.py --limit 200
 ```
 
+## CLI Architecture
+
+The AutoMem CLI (`automem-cli/`) is a standalone Python package installable via `uv tool install automem-cli`:
+
+- **Entry point**: `src/automem_cli/cli.py` - Click-based command group
+- **API client**: `src/automem_cli/api.py` - HTTP client wrapping AutoMem REST API
+- **Configuration**: `src/automem_cli/config.py` - Loads from `.automem/config.yml` or environment variables
+- **Git integration**: `src/automem_cli/git_context.py` - Automatically captures git context (branch, commit, repo) when storing memories
+- **Output formatting**: `src/automem_cli/output.py` - Terminal formatting with rich text support
+
+### CLI Design Patterns
+
+- **Project discovery**: Searches upward from CWD for `.automem/config.yml` (git-style)
+- **Automatic git context**: `am store` captures current branch/commit/repo without user action
+- **Discovery chains**: `--discovered-from <id>` creates `DERIVED_FROM` edges automatically
+- **Dual tag syntax**: `--tag foo --tag bar` or `--tags foo,bar,baz` both supported
+- **Claude Code hooks**: `am install-hooks` adds SessionStart/Stop/PreCompact reminders to `.claude/settings.local.json`
+
 ## Key Implementation Patterns
 
 - Memory IDs are UUIDs stored in both databases for cross-referencing
@@ -244,3 +305,4 @@ python scripts/reembed_embeddings.py --limit 200
 - Graph operations are atomic with automatic rollback on errors
 - Vector store errors are logged but don't block graph writes
 - Consolidation runs in background threads without blocking API requests
+- CLI automatically captures git context (branch, commit, repo) on `am store` operations
